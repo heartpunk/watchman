@@ -13,7 +13,7 @@ try:
 except ImportError:
     from distutils.core import setup, Extension
 
-os.path.dirname(os.path.realpath(__file__))
+watchman_src_dir = os.path.dirname(os.path.realpath(__file__))
 
 # Setuptools is very picky about the path on Windows. They have to be relative
 # paths, and on Windows that means we have to be on the same drive as the source
