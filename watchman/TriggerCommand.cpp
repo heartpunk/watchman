@@ -30,27 +30,29 @@ void parse_redirection(
     const char* label) {
   *flags = 0;
 
-  auto ele = trig.get_default(label);
-  if (!ele) {
+  auto maybe = trig.get_optional(label);
+  if (!maybe) {
     // Specifying a redirection is optional
     return;
   }
+  auto& ele = *maybe;
 
   if (!ele.isString()) {
-    throw CommandValidationError(label, " must be a string");
+    CommandValidationError::throwf("{} must be a string", label);
   }
 
   name = json_string_value(ele);
   if (name.empty() || name[0] != '>') {
-    throw CommandValidationError(
-        label, ": must be prefixed with either > or >>, got ", name);
+    CommandValidationError::throwf(
+        "{}: must be prefixed with either > or >>, got {}", label, name);
   }
 
   *flags = O_CREAT | O_WRONLY;
 
   if (name[1] == '>') {
 #ifdef _WIN32
-    throw CommandValidationError(label, ": Windows does not support O_APPEND");
+    CommandValidationError::throwf(
+        "{}: Windows does not support O_APPEND", label);
 #else
     *flags |= O_APPEND;
     name.erase(0, 2);
@@ -61,8 +63,8 @@ void parse_redirection(
   }
 }
 
-std::unique_ptr<watchman_stream> prepare_stdin(
-    struct TriggerCommand* cmd,
+ResultErrno<std::unique_ptr<watchman_stream>> prepare_stdin(
+    TriggerCommand* cmd,
     QueryResult* res) {
   char stdin_file_name[WATCHMAN_NAME_MAX];
 
@@ -72,9 +74,10 @@ std::unique_ptr<watchman_stream> prepare_stdin(
 
   // Adjust result to fit within the specified limit
   if (cmd->max_files_stdin > 0) {
-    auto& fileList = res->resultsArray.array();
-    auto n_files = std::min(size_t(cmd->max_files_stdin), fileList.size());
-    fileList.resize(std::min(fileList.size(), n_files));
+    auto& fileList = res->resultsArray.results;
+    if (fileList.size() > cmd->max_files_stdin) {
+      fileList.erase(fileList.begin() + cmd->max_files_stdin, fileList.end());
+    }
   }
 
   /* prepare the input stream for the child process */
@@ -85,12 +88,13 @@ std::unique_ptr<watchman_stream> prepare_stdin(
       getTemporaryDirectory().c_str());
   auto stdin_file = w_mkstemp(stdin_file_name);
   if (!stdin_file) {
+    int err = errno;
     logf(
         ERR,
         "unable to create a temporary file: {} {}\n",
         stdin_file_name,
-        folly::errnoStr(errno));
-    return NULL;
+        folly::errnoStr(err));
+    return err;
   }
 
   /* unlink the file, we don't need it in the filesystem;
@@ -99,29 +103,32 @@ std::unique_ptr<watchman_stream> prepare_stdin(
 
   switch (cmd->stdin_style) {
     case input_json: {
-      w_jbuffer_t buffer;
+      PduBuffer buffer;
 
       logf(DBG, "input_json: sending json object to stm\n");
-      if (!buffer.jsonEncodeToStream(res->resultsArray, stdin_file.get(), 0)) {
+      auto encodeResult = buffer.jsonEncodeToStream(
+          std::move(res->resultsArray).toJson(), stdin_file.get(), 0);
+      if (encodeResult.hasError()) {
         logf(
             ERR,
             "input_json: failed to write json data to stream: {}\n",
-            folly::errnoStr(errno));
-        return NULL;
+            folly::errnoStr(encodeResult.error()));
+        return encodeResult.error();
       }
       break;
     }
     case input_name_list:
-      for (auto& name : res->resultsArray.array()) {
+      for (auto& name : res->resultsArray.results) {
         auto& nameStr = json_to_w_string(name);
         if (stdin_file->write(nameStr.data(), nameStr.size()) !=
                 (int)nameStr.size() ||
             stdin_file->write("\n", 1) != 1) {
+          int err = errno;
           logf(
               ERR,
               "write failure while producing trigger stdin: {}\n",
-              folly::errnoStr(errno));
-          return nullptr;
+              folly::errnoStr(err));
+          return err;
         }
       }
       break;
@@ -136,7 +143,7 @@ std::unique_ptr<watchman_stream> prepare_stdin(
 
 void spawn_command(
     const std::shared_ptr<Root>& root,
-    struct TriggerCommand* cmd,
+    TriggerCommand* cmd,
     QueryResult* res,
     ClockSpec* since_spec) {
   bool file_overflow = false;
@@ -151,20 +158,22 @@ void spawn_command(
   // Record an overflow before we call prepare_stdin(), which mutates
   // and resizes the results to fit the specified limit.
   if (cmd->max_files_stdin > 0 &&
-      res->resultsArray.array().size() > cmd->max_files_stdin) {
+      res->resultsArray.results.size() > cmd->max_files_stdin) {
     file_overflow = true;
   }
 
-  auto stdin_file = prepare_stdin(cmd, res);
-  if (!stdin_file) {
+  auto stdin_file_res = prepare_stdin(cmd, res);
+  if (stdin_file_res.hasError()) {
     logf(
         ERR,
         "trigger {}:{} {}\n",
         root->root_path,
         cmd->triggername,
-        folly::errnoStr(errno));
+        folly::errnoStr(stdin_file_res.error()));
     return;
   }
+
+  auto stdin_file = std::move(stdin_file_res).value();
 
   // Assumption: that only one thread will be executing on a given
   // cmd instance so that mutation of cmd->env is safe.
@@ -191,12 +200,12 @@ void spawn_command(
   }
 
   // Compute args
-  auto args = json_deep_copy(cmd->command);
+  std::vector<json_ref> args = cmd->command.value().array();
 
   if (cmd->append_files) {
     // Measure how much space the base args take up
-    for (size_t i = 0; i < json_array_size(args); i++) {
-      const char* ele = json_string_value(json_array_get(args, i));
+    for (size_t i = 0; i < args.size(); i++) {
+      const char* ele = json_string_value(args[i]);
 
       argspace_remaining -= strlen(ele) + 1 + sizeof(char*);
     }
@@ -216,7 +225,7 @@ void spawn_command(
       }
       argspace_remaining -= size;
 
-      json_array_append_new(args, w_string_to_json(item));
+      args.push_back(w_string_to_json(item));
     }
   }
 
@@ -251,9 +260,9 @@ void spawn_command(
     working_dir = root->root_path;
   }
 
-  auto cwd = cmd->definition.get_default("chdir");
+  auto cwd = cmd->definition.get_optional("chdir");
   if (cwd) {
-    auto target = json_to_w_string(cwd);
+    auto target = json_to_w_string(*cwd);
     if (w_is_path_absolute_cstr_len(target.data(), target.size())) {
       working_dir = target;
     } else {
@@ -269,7 +278,8 @@ void spawn_command(
       cmd->current_proc->kill();
       cmd->current_proc->wait();
     }
-    cmd->current_proc = std::make_unique<ChildProcess>(args, std::move(opts));
+    cmd->current_proc = std::make_unique<ChildProcess>(
+        json_array(std::move(args)), std::move(opts));
   } catch (const std::exception& exc) {
     log(ERR,
         "trigger ",
@@ -300,13 +310,13 @@ TriggerCommand::TriggerCommand(
       savedStateFactory_{savedStateFactory},
       ping_(w_event_make_sockets()) {
   auto queryDef = json_object();
-  auto expr = definition.get_default("expression");
+  auto expr = definition.get_optional("expression");
   if (expr) {
-    queryDef.set("expression", json_ref(expr));
+    queryDef.set("expression", json_ref(*expr));
   }
-  auto relative_root = definition.get_default("relative_root");
+  auto relative_root = definition.get_optional("relative_root");
   if (relative_root) {
-    json_object_set_nocheck(queryDef, "relative_root", relative_root);
+    json_object_set_nocheck(queryDef, "relative_root", *relative_root);
   }
 
   query = parseQuery(root, queryDef);
@@ -314,16 +324,17 @@ TriggerCommand::TriggerCommand(
     return;
   }
 
-  auto name = trig.get_default("name");
-  if (!name || !name.isString()) {
+  auto name = trig.get_optional("name");
+  if (!name || !name->isString()) {
     throw CommandValidationError("invalid or missing name");
   }
-  triggername = json_to_w_string(name);
+  triggername = json_to_w_string(*name);
 
-  command = definition.get_default("command");
-  if (!command || !command.isArray() || !json_array_size(command)) {
+  auto cmd = definition.get_optional("command");
+  if (!cmd || !cmd->isArray() || !json_array_size(*cmd)) {
     throw CommandValidationError("invalid command array");
   }
+  command = *cmd;
 
   append_files = trig.get_default("append_files", json_false()).asBool();
   if (append_files) {
@@ -337,14 +348,14 @@ TriggerCommand::TriggerCommand(
     query->dedup_results = true;
   }
 
-  auto ele = definition.get_default("stdin");
+  auto ele = definition.get_optional("stdin");
   if (!ele) {
     stdin_style = input_dev_null;
-  } else if (ele.isArray()) {
+  } else if (ele->isArray()) {
     stdin_style = input_json;
     parse_field_list(ele, &query->fieldList);
-  } else if (ele.isString()) {
-    const char* str = json_string_value(ele);
+  } else if (ele->isString()) {
+    const char* str = json_string_value(*ele);
     if (!strcmp(str, "/dev/null")) {
       stdin_style = input_dev_null;
     } else if (!strcmp(str, "NAME_PER_LINE")) {
@@ -352,7 +363,7 @@ TriggerCommand::TriggerCommand(
       parse_field_list(
           json_array({typed_string_to_json("name")}), &query->fieldList);
     } else {
-      throw CommandValidationError("invalid stdin value ", str);
+      CommandValidationError::throwf("invalid stdin value {}", str);
     }
   } else {
     throw CommandValidationError("invalid value for stdin");
@@ -389,7 +400,7 @@ void TriggerCommand::run(const std::shared_ptr<Root>& root) {
       "trigger ", triggername.view(), " ", root->root_path.view());
 
   try {
-    watchman_event_poll pfd[1];
+    EventPoll pfd[1];
     pfd[0].evt = ping_.get();
 
     log(DBG, "waiting for settle\n");
@@ -404,7 +415,7 @@ void TriggerCommand::run(const std::shared_ptr<Root>& root) {
         subscriber_->getPending(pending);
         bool seenSettle = false;
         for (auto& item : pending) {
-          if (item->payload.get_default("settled")) {
+          if (item->payload.get_optional("settled")) {
             seenSettle = true;
             break;
           }
@@ -487,7 +498,7 @@ bool TriggerCommand::maybeSpawn(const std::shared_ptr<Root>& root) {
         "trigger \"",
         triggername,
         "\" generated ",
-        res.resultsArray.array().size(),
+        res.resultsArray.results.size(),
         " results\n");
 
     // create a new spec that will be used the next time
@@ -501,7 +512,7 @@ bool TriggerCommand::maybeSpawn(const std::shared_ptr<Root>& root) {
         res.clockAtStartOfQuery.position().ticks,
         " ticks next time\n");
 
-    if (!res.resultsArray.array().empty()) {
+    if (!res.resultsArray.results.empty()) {
       didRun = true;
       spawn_command(root, this, &res, saved_spec.get());
     }

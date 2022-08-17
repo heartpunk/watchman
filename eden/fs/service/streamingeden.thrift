@@ -15,18 +15,6 @@ enum FsEventType {
   FINISH = 2,
 }
 
-/**
- * Common timestamps for every trace event, used to measure durations and
- * display wall clock time.
- */
-struct TraceEventTimes {
-  // Nanoseconds since epoch.
-  1: i64 timestamp;
-  // Nanoseconds since arbitrary clock base, used for computing request
-  // durations between start and finish.
-  2: i64 monotonic_time_ns;
-}
-
 struct RequestInfo {
   // The pid that originated this request.
   1: optional eden.pid_t pid;
@@ -41,7 +29,7 @@ struct FsEvent {
   // durations between start and finish.
   2: i64 monotonic_time_ns;
 
-  7: TraceEventTimes times;
+  7: eden.TraceEventTimes times;
 
   3: FsEventType type;
 
@@ -69,6 +57,18 @@ struct FsEvent {
   9: optional i64 result;
 }
 
+enum ThriftRequestEventType {
+  UNKNOWN = 0,
+  START = 1,
+  FINISH = 2,
+}
+
+struct ThriftRequestEvent {
+  1: eden.TraceEventTimes times;
+  2: ThriftRequestEventType eventType;
+  3: eden.ThriftRequestMetadata requestMetadata;
+}
+
 /*
  * Bits that control the events traced from traceFsEvents.
  *
@@ -94,8 +94,21 @@ enum HgResourceType {
   TREE = 2,
 }
 
+enum HgImportPriority {
+  LOW = 0,
+  NORMAL = 1,
+  HIGH = 2,
+}
+
+enum HgImportCause {
+  UNKNOWN = 0,
+  FS = 1,
+  THRIFT = 2,
+  PREFETCH = 3,
+}
+
 struct HgEvent {
-  1: TraceEventTimes times;
+  1: eden.TraceEventTimes times;
 
   2: HgEventType eventType;
   3: HgResourceType resourceType;
@@ -107,6 +120,36 @@ struct HgEvent {
   6: binary path;
 
   7: optional RequestInfo requestInfo;
+  8: HgImportPriority importPriority;
+  9: HgImportCause importCause;
+}
+
+/**
+ * The value of a stream item.
+ *
+ * Each stream item refers to a single file, along with the file status and its
+ * type.
+ */
+struct ChangedFileResult {
+  1: eden.PathString name;
+  2: eden.ScmFileStatus status;
+  // Dtype for this file which may be set to UNKNOWN.
+  3: eden.Dtype dtype;
+}
+
+/**
+ * Return value of the streamChangesSince.
+ */
+struct ChangesSinceResult {
+  1: eden.JournalPosition toPosition;
+}
+
+/**
+ * Argument to streamChangesSince API.
+ */
+struct StreamChangesSinceParams {
+  1: eden.PathString mountPoint;
+  2: eden.JournalPosition fromPosition;
 }
 
 /**
@@ -151,6 +194,8 @@ service StreamingEdenService extends eden.EdenService {
     2: i64 eventCategoryMask,
   );
 
+  stream<ThriftRequestEvent> traceThriftRequestEvents();
+
   /**
    * Returns, in order, a stream of hg import requests for the given mount.
    *
@@ -158,4 +203,35 @@ service StreamingEdenService extends eden.EdenService {
    * started, and finished.
    */
   stream<HgEvent> traceHgEvents(1: eden.PathString mountPoint);
+
+  /**
+   * Returns, in order, a stream of inode events for the given mount.
+   *
+   * Currently this includes only start and end events for Inode materializations,
+   * though we intend to generalize this to Inode loads as well soon.
+   */
+  stream<eden.InodeEvent> traceInodeEvents(1: eden.PathString mountPoint);
+
+  /**
+   * Returns a stream of changes since the given JournalPosition.
+   *
+   * Files are returned in no special order and aren't guaranteed to be unique.
+   * For instance, a checkout from A to B and then back to A may return all the
+   * files changed in between these revisions twice, once for the first
+   * transition, a second time for the second transition.
+   *
+   * Since the stream can potentially contain a lot of files, clients are
+   * advised to implement some bounding mechanism and close the stream when too
+   * many files have been received.
+   *
+   * Along with the stream, this returns a ChangesSinceResult containing a
+   * JournalPosition to inform the client about the last position considered.
+   * Future calls to streamChangesSince should query from that JournalPosition
+   * to avoid losing information.
+   */
+  ChangesSinceResult, stream<
+    ChangedFileResult throws (1: eden.EdenError ex)
+  > streamChangesSince(1: StreamChangesSinceParams params) throws (
+    1: eden.EdenError ex,
+  );
 }

@@ -155,7 +155,6 @@ struct InotifyWatcher : public Watcher {
 
   std::unique_ptr<DirHandle> startWatchDir(
       const std::shared_ptr<Root>& root,
-      struct watchman_dir* dir,
       const char* path) override;
 
   Watcher::ConsumeNotifyRet consumeNotify(
@@ -206,7 +205,6 @@ InotifyWatcher::InotifyWatcher(const Configuration& config)
 
 std::unique_ptr<DirHandle> InotifyWatcher::startWatchDir(
     const std::shared_ptr<Root>&,
-    struct watchman_dir*,
     const char* path) {
   // Carry out our very strict opendir first to ensure that we're not
   // traversing symlinks in the context of this root
@@ -488,10 +486,11 @@ void InotifyWatcher::stopThreads() {
 json_ref InotifyWatcher::getDebugInfo() {
   json_ref events = json_null();
   if (ringBuffer_) {
-    events = json_array();
+    std::vector<json_ref> arr;
     for (auto& entry : ringBuffer_->readAll()) {
-      json_array_append(events, entry.asJsonValue());
+      arr.push_back(entry.asJsonValue());
     }
+    events = json_array(std::move(arr));
   }
   return json_object({
       {"events", events},

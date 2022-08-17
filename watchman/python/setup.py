@@ -9,9 +9,9 @@
 import os
 
 try:
-    from setuptools import setup, Extension
+    from setuptools import Extension, setup
 except ImportError:
-    from distutils.core import setup, Extension
+    from distutils.core import Extension, setup
 
 watchman_src_dir = os.path.dirname(os.path.realpath(__file__))
 

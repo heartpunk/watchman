@@ -11,12 +11,17 @@
 #include <folly/SocketAddress.h>
 #include <folly/String.h>
 #include <folly/net/NetworkSocket.h>
+#include <folly/system/Shell.h>
 
 #include <stdio.h>
-#include <variant>
+
+#include <fmt/format.h>
 
 #include "watchman/ChildProcess.h"
+#include "watchman/Client.h"
 #include "watchman/Clock.h"
+#include "watchman/Command.h"
+#include "watchman/Connect.h"
 #include "watchman/GroupLookup.h"
 #include "watchman/LogConfig.h"
 #include "watchman/Logging.h"
@@ -39,26 +44,21 @@
 #ifdef _WIN32
 #include <Lmcons.h> // @manual
 #include <Shlobj.h> // @manual
-#include <deelevate.h> // @manual
-#endif
-
-#ifndef _WIN32
-#include <poll.h> // @manual
+#include "watchman/thirdparty/deelevate_binding/include/deelevate.h" // @manual
 #endif
 
 using namespace watchman;
-using Options = ChildProcess::Options;
-
-static enum w_pdu_type server_pdu = is_bser;
-static enum w_pdu_type output_pdu = is_json_pretty;
-static uint32_t server_capabilities = 0;
-static uint32_t output_capabilities = 0;
-static char** daemon_argv = NULL;
-static struct sockaddr_un un;
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // @manual
 #endif
+
+namespace {
+/// How should server requests be encoded?
+PduFormat server_format{is_bser, 0};
+/// How should output to stdout be encoded?
+PduFormat output_format{is_json_pretty, 0};
+} // namespace
 
 static void compute_file_name(
     std::string& str,
@@ -76,6 +76,8 @@ const std::string& get_pid_file() {
   return flags.pid_file;
 }
 } // namespace
+
+W_CAP_REG("bser-v2")
 
 /**
  * Log and fatal if Watchman was started with a low priority, which can cause a
@@ -311,11 +313,11 @@ static SpawnResult run_service_as_daemon() {
 #endif
 
 #ifdef _WIN32
-static SpawnResult spawn_win32() {
+static SpawnResult spawn_win32(const std::vector<std::string>& daemon_argv) {
   char module_name[WATCHMAN_NAME_MAX];
   GetModuleFileName(NULL, module_name, sizeof(module_name));
 
-  Options opts;
+  ChildProcess::Options opts;
   opts.setFlags(POSIX_SPAWN_SETPGROUP);
   opts.open(STDIN_FILENO, "/dev/null", O_RDONLY, 0666);
   opts.open(
@@ -327,8 +329,8 @@ static SpawnResult spawn_win32() {
   opts.chdir("/");
 
   std::vector<std::string_view> args{module_name, "--foreground"};
-  for (size_t i = 0; daemon_argv[i]; i++) {
-    args.push_back(daemon_argv[i]);
+  for (auto& arg : daemon_argv) {
+    args.push_back(arg);
   }
 
   ChildProcess proc(args, std::move(opts));
@@ -351,13 +353,14 @@ static SpawnResult spawn_win32() {
 // Spawn watchman via a site-specific spawn helper program.
 // We'll pass along any daemon-appropriate arguments that
 // we noticed during argument parsing.
-static SpawnResult spawn_site_specific(const char* spawner) {
-  std::vector<std::string_view> args{
-      spawner,
-  };
-
-  for (size_t i = 0; daemon_argv[i]; i++) {
-    args.push_back(daemon_argv[i]);
+static SpawnResult spawn_site_specific(
+    const std::vector<std::string>& daemon_argv,
+    const char* spawner) {
+  std::vector<std::string_view> args;
+  args.reserve(1 + daemon_argv.size());
+  args.push_back(spawner);
+  for (auto& arg : daemon_argv) {
+    args.push_back(arg);
   }
 
   close_random_fds();
@@ -371,7 +374,7 @@ static SpawnResult spawn_site_specific(const char* spawner) {
   // run_service() function above.
   // However, we do need to make sure that any output from both stdout
   // and stderr goes to stderr of the end user.
-  Options opts;
+  ChildProcess::Options opts;
   opts.open(STDIN_FILENO, "/dev/null", O_RDONLY, 0666);
   opts.dup2(STDERR_FILENO, STDOUT_FILENO);
   opts.dup2(STDERR_FILENO, STDERR_FILENO);
@@ -406,6 +409,30 @@ static SpawnResult spawn_site_specific(const char* spawner) {
 #endif
 
 #ifdef __APPLE__
+
+std::vector<std::string> escape_args_for_sh(
+    const std::vector<std::string>& args) {
+  std::vector<std::string> transformedArgs{};
+  transformedArgs.reserve(args.size());
+
+  for (auto& arg : args) {
+    transformedArgs.push_back(folly::shellQuote(arg));
+  }
+  return transformedArgs;
+}
+
+std::string prep_args_for_plist(
+    const std::vector<std::string>& args,
+    size_t indentation) {
+  std::vector<std::string> transformedArgs{};
+  transformedArgs.reserve(args.size());
+  for (auto& arg : args) {
+    transformedArgs.push_back(
+        fmt::format("{:>{}}<string>{}</string>\n", "", indentation, arg));
+  }
+  return folly::join("", transformedArgs);
+}
+
 static SpawnResult spawn_via_launchd() {
   char watchman_path[WATCHMAN_NAME_MAX];
   uint32_t size = sizeof(watchman_path);
@@ -446,7 +473,8 @@ static SpawnResult spawn_via_launchd() {
     // Unload any that may already exist, as it is likely wrong
 
     ChildProcess unload_proc(
-        {"/bin/launchctl", "unload", "-F", plist_path}, Options());
+        {"/bin/launchctl", "unload", "-F", plist_path},
+        ChildProcess::Options());
     unload_proc.wait();
 
     // Forcibly remove the plist.  In some cases it may have some attributes
@@ -467,6 +495,30 @@ static SpawnResult spawn_via_launchd() {
 
   compute_file_name(flags.pid_file, computeUserName(), "pid", "pidfile");
 
+  const char* path_env =
+      Configuration().getString("subprocess_path_env", getenv("PATH"));
+  // If subprocess_path_env is not set and PATH is not in the environment,
+  // set the path to the empty string.
+  if (path_env == nullptr) {
+    path_env = "";
+  }
+
+  std::vector<std::string> watchman_args{
+      watchman_path,
+      "--foreground",
+      fmt::format("--logfile={}", logging::log_name),
+      fmt::format("--log-level={}", logging::log_level),
+      fmt::format("--sockname={}", get_unix_sock_name()),
+      fmt::format("--statefile={}", flags.watchman_state_file),
+      fmt::format("--pidfile={}", flags.pid_file)};
+  std::string watchman_spawning_command;
+
+  auto spawn_with_sh = Configuration().getBool("macos_spawn_with_sh", false);
+  if (spawn_with_sh) {
+    watchman_args = escape_args_for_sh(std::move(watchman_args));
+    watchman_args = {"/bin/sh", "-c", folly::join(" ", watchman_args)};
+  }
+
   auto plist_content = folly::to<std::string>(
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
@@ -478,29 +530,8 @@ static SpawnResult spawn_via_launchd() {
       "    <key>Disabled</key>\n"
       "    <false/>\n"
       "    <key>ProgramArguments</key>\n"
-      "    <array>\n"
-      "        <string>",
-      watchman_path,
-      "</string>\n"
-      "        <string>--foreground</string>\n"
-      "        <string>--logfile=",
-      logging::log_name,
-      "</string>\n"
-      "        <string>--log-level=",
-      logging::log_level,
-      "</string>\n"
-      // TODO: switch from `--sockname` to `--unix-listener-path`
-      // after a grace period to allow for sane results if we
-      // roll back to an earlier version
-      "        <string>--sockname=",
-      get_unix_sock_name(),
-      "</string>\n"
-      "        <string>--statefile=",
-      flags.watchman_state_file,
-      "</string>\n"
-      "        <string>--pidfile=",
-      flags.pid_file,
-      "</string>\n"
+      "    <array>\n",
+      prep_args_for_plist(watchman_args, 8),
       "    </array>\n"
       "    <key>KeepAlive</key>\n"
       "    <dict>\n"
@@ -513,10 +544,7 @@ static SpawnResult spawn_via_launchd() {
       "    <dict>\n"
       "        <key>PATH</key>\n"
       "        <string>",
-      // TODO: add this control behind a config instead of hardcoding it.
-      // The choice here is taking the default system path and adding
-      // common locations for Mercurial (and dependency) installations.
-      "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+      path_env,
       "</string>\n"
       "    </dict>\n"
       "    <key>ProcessType</key>\n"
@@ -531,7 +559,7 @@ static SpawnResult spawn_via_launchd() {
   chmod(plist_path, 0644);
 
   ChildProcess load_proc(
-      {"/bin/launchctl", "load", "-F", plist_path}, Options());
+      {"/bin/launchctl", "load", "-F", plist_path}, ChildProcess::Options());
   auto res = load_proc.wait();
 
   if (WIFEXITED(res) && WEXITSTATUS(res) == 0) {
@@ -549,7 +577,7 @@ static SpawnResult spawn_via_launchd() {
 }
 #endif
 
-static void parse_encoding(const std::string& enc, enum w_pdu_type* pdu) {
+static void parse_encoding(std::string_view enc, PduType* pdu) {
   if (enc.empty()) {
     return;
   }
@@ -780,80 +808,61 @@ static void setup_sock_name() {
       "log",
       "logfile",
       /*require_absolute=*/logging::log_name != "-");
-
-  if (flags.unix_sock_name.size() >= sizeof(un.sun_path) - 1) {
-    log(FATAL, flags.unix_sock_name, ": path is too long\n");
-  }
-  un.sun_family = PF_LOCAL;
-  memcpy(
-      un.sun_path,
-      flags.unix_sock_name.c_str(),
-      flags.unix_sock_name.size() + 1);
 }
 
-static bool should_start(int err) {
-  if (err == ECONNREFUSED) {
-    return true;
+static ResultErrno<folly::Unit> try_command(
+    const Command& command,
+    int timeout) {
+  auto stmResult = w_stm_connect(timeout * 1000);
+  if (stmResult.hasError()) {
+    return stmResult.error();
   }
-  if (err == ENOENT) {
-    return true;
+
+  if (command.isNullCommand()) {
+    // We've confirmed we can connect -- there's nothing else to do with the
+    // null command.
+    return folly::unit;
   }
-  return false;
+
+  auto stream = std::move(stmResult).value();
+
+  return command.run(
+      *stream,
+      flags.persistent,
+      server_format,
+      output_format,
+      flags.yes_pretty ? Pretty::Yes
+                       : (flags.no_pretty ? Pretty::No : Pretty::IfTty));
 }
 
-static bool try_command(json_t* cmd, int timeout) {
-  auto client = w_stm_connect(timeout * 1000);
-  if (!client) {
-    return false;
+static bool try_client_mode_command(const Command& command, bool pretty) {
+  auto client = std::make_shared<watchman::Client>();
+  client->client_mode = true;
+
+  bool res = client->dispatchCommand(command, CMD_CLIENT);
+
+  if (!client->responses.empty()) {
+    json_dumpf(
+        client->responses.front(),
+        stdout,
+        pretty ? JSON_INDENT(4) : JSON_COMPACT);
+    printf("\n");
   }
 
-  // Start in a well-defined non-blocking state as we can't tell
-  // what mode we're in on windows until we've set it to something
-  // explicitly at least once before!
-  client->setNonBlock(false);
-
-  if (!cmd) {
-    return true;
-  }
-
-  w_jbuffer_t buffer;
-  w_jbuffer_t output_pdu_buffer;
-
-  // Send command
-  if (!buffer.pduEncodeToStream(
-          server_pdu, server_capabilities, cmd, client.get())) {
-    int err = errno;
-    logf(ERR, "error sending PDU to server\n");
-    errno = err;
-    return false;
-  }
-
-  buffer.clear();
-
-  do {
-    if (!buffer.passThru(
-            output_pdu,
-            output_capabilities,
-            &output_pdu_buffer,
-            client.get())) {
-      return false;
-    }
-  } while (flags.persistent);
-
-  return true;
+  return res;
 }
 
-static void parse_cmdline(int* argcp, char*** argvp) {
+static std::vector<std::string> parse_cmdline(int* argcp, char*** argvp) {
   cfg_load_global_config_file();
 
-  watchman::parseOptions(argcp, argvp, &daemon_argv);
+  auto daemon_argv = watchman::parseOptions(argcp, argvp);
   watchman::getLog().setStdErrLoggingLevel(
-      static_cast<enum watchman::LogLevel>(logging::log_level));
+      static_cast<watchman::LogLevel>(logging::log_level));
   setup_sock_name();
-  parse_encoding(flags.server_encoding, &server_pdu);
-  parse_encoding(flags.output_encoding, &output_pdu);
+  parse_encoding(flags.server_encoding, &server_format.type);
+  parse_encoding(flags.output_encoding, &output_format.type);
   if (flags.output_encoding.empty()) {
-    output_pdu = flags.no_pretty ? is_json_compact : is_json_pretty;
+    output_format.type = flags.no_pretty ? is_json_compact : is_json_pretty;
   }
 
   // Prevent integration tests that call the watchman cli from
@@ -862,75 +871,73 @@ static void parse_cmdline(int* argcp, char*** argvp) {
     flags.no_spawn = true;
   }
 
-  if (Configuration().getBool("tcp-listener-enable", false)) {
-    // hg requires the state-enter/state-leave commands, which are disabled over
-    // TCP by default since at present it is unauthenticated. This should be
-    // removed once TLS authentication is added to the TCP listener.
-    // TODO: When this code is removed, lookup() can be changed to return a
-    // const pointer.
-    lookup_command("state-enter", CMD_DAEMON)->flags.set(CMD_ALLOW_ANY_USER);
-    lookup_command("state-leave", CMD_DAEMON)->flags.set(CMD_ALLOW_ANY_USER);
-  }
+  return daemon_argv;
 }
 
-static json_ref build_command(int argc, char** argv) {
-  // Read blob from stdin
+static Command build_command_from_stdin() {
+  auto err = json_error_t();
+  PduBuffer buf;
+
+  auto cmd = buf.decodeNext(w_stm_stdin(), &err);
+
+  if (buf.format.type == is_bser) {
+    // If they used bser for the input, select bser for output
+    // unless they explicitly requested something else
+    if (flags.server_encoding.empty()) {
+      server_format.type = is_bser;
+    }
+    if (flags.output_encoding.empty()) {
+      output_format.type = is_bser;
+    }
+  } else if (buf.format.type == is_bser_v2) {
+    // If they used bser v2 for the input, select bser v2 for output
+    // unless they explicitly requested something else
+    if (flags.server_encoding.empty()) {
+      server_format.type = is_bser_v2;
+    }
+    if (flags.output_encoding.empty()) {
+      output_format.type = is_bser_v2;
+    }
+  }
+
+  if (!cmd) {
+    fprintf(
+        stderr,
+        "failed to parse command from stdin: "
+        "line %d, column %d, position %d: %s\n",
+        err.line,
+        err.column,
+        err.position,
+        err.text);
+    exit(1);
+  }
+  return Command::parse(std::move(*cmd));
+}
+
+static Command build_command(int argc, char** argv) {
   if (flags.json_input_arg) {
-    auto err = json_error_t();
-    w_jbuffer_t buf;
-
-    auto cmd = buf.decodeNext(w_stm_stdin(), &err);
-
-    if (buf.pdu_type == is_bser) {
-      // If they used bser for the input, select bser for output
-      // unless they explicitly requested something else
-      if (flags.server_encoding.empty()) {
-        server_pdu = is_bser;
-      }
-      if (flags.output_encoding.empty()) {
-        output_pdu = is_bser;
-      }
-    } else if (buf.pdu_type == is_bser_v2) {
-      // If they used bser v2 for the input, select bser v2 for output
-      // unless they explicitly requested something else
-      if (flags.server_encoding.empty()) {
-        server_pdu = is_bser_v2;
-      }
-      if (flags.output_encoding.empty()) {
-        output_pdu = is_bser_v2;
-      }
-    }
-
-    if (!cmd) {
-      fprintf(
-          stderr,
-          "failed to parse command from stdin: "
-          "line %d, column %d, position %d: %s\n",
-          err.line,
-          err.column,
-          err.position,
-          err.text);
-      exit(1);
-    }
-    return cmd;
+    return build_command_from_stdin();
   }
 
   // Special case: no arguments means that we just want
   // to verify that the service is up, starting it if
-  // needed
+  // needed.
+  // TODO: Add telemetry. Does anyone actually do this?
   if (argc == 0) {
-    return nullptr;
+    return Command{nullptr};
   }
 
-  auto cmd = json_array();
-  for (int i = 0; i < argc; i++) {
-    json_array_append_new(cmd, typed_string_to_json(argv[i], W_STRING_UNICODE));
+  w_string name = argv[0];
+  std::vector<json_ref> args;
+  for (int i = 1; i < argc; i++) {
+    args.push_back(typed_string_to_json(argv[i], W_STRING_UNICODE));
   }
 
-  return cmd;
+  return Command{std::move(name), json_array(std::move(args))};
 }
 
-static SpawnResult try_spawn_watchman() {
+static SpawnResult try_spawn_watchman(
+    const std::vector<std::string>& daemon_argv) {
   // Every spawner that doesn't fork() this client process is susceptible to a
   // race condition if `watchman shutdown-server` and `watchman <command>` are
   // run in short order. The latter tries to spawn a daemon while the former is
@@ -955,14 +962,14 @@ static SpawnResult try_spawn_watchman() {
   // spawning functionality.
   const char* site_spawn = cfg_get_string("spawn_watchman_service", nullptr);
   if (site_spawn) {
-    return spawn_site_specific(site_spawn);
+    return spawn_site_specific(daemon_argv, site_spawn);
   }
 #endif
 
 #if defined(__APPLE__)
   return spawn_via_launchd();
 #elif defined(_WIN32)
-  return spawn_win32();
+  return spawn_win32(daemon_argv);
 #else
   return run_service_as_daemon();
 #endif
@@ -979,7 +986,7 @@ static int inner_main(int argc, char** argv) {
     folly::SingletonVault::singleton()->destroyInstances();
   };
 
-  parse_cmdline(&argc, &argv);
+  auto daemon_argv = parse_cmdline(&argc, &argv);
 
 #ifdef _WIN32
   // On Windows its not possible to connect to elevated Watchman daemon from
@@ -999,13 +1006,19 @@ static int inner_main(int argc, char** argv) {
 
   w_set_thread_name("cli");
   auto cmd = build_command(argc, argv);
-  preprocess_command(cmd, output_pdu, output_capabilities);
+  cmd.validateOrExit(output_format);
 
-  bool ran = try_command(cmd, 0);
-  if (!ran && should_start(errno)) {
+  auto should_start = [](int err) -> bool {
+    return err == ECONNREFUSED || err == ENOENT;
+  };
+
+  auto ran = try_command(cmd, 0);
+  if (ran.hasError() && should_start(ran.error())) {
     if (flags.no_spawn) {
       if (!flags.no_local) {
-        ran = try_client_mode_command(cmd, !flags.no_pretty);
+        if (try_client_mode_command(cmd, !flags.no_pretty)) {
+          ran = folly::unit;
+        }
       }
     } else {
       // Failed to run command. Try to spawn a daemon.
@@ -1019,7 +1032,7 @@ static int inner_main(int argc, char** argv) {
       bool spawned = false;
       while (true) {
         if (!spawned) {
-          auto spawn_result = try_spawn_watchman();
+          auto spawn_result = try_spawn_watchman(daemon_argv);
           switch (spawn_result.status) {
             case SpawnResult::Spawned:
               spawned = true;
@@ -1034,7 +1047,7 @@ static int inner_main(int argc, char** argv) {
         }
 
         ran = try_command(cmd, 10);
-        if (!ran && should_start(errno) && attempts-- > 0) {
+        if (ran.hasError() && should_start(ran.error()) && attempts-- > 0) {
           /* sleep override */ std::this_thread::sleep_for(interval);
           // 10 doublings of 10 ms is about 10 seconds total.
           interval *= 2;
@@ -1046,7 +1059,7 @@ static int inner_main(int argc, char** argv) {
     }
   }
 
-  if (ran) {
+  if (ran.hasValue()) {
     return 0;
   }
 
@@ -1055,7 +1068,7 @@ static int inner_main(int argc, char** argv) {
         "unable to talk to your watchman on ",
         get_sock_name_legacy(),
         "! (",
-        folly::errnoStr(errno),
+        folly::errnoStr(ran.error()),
         ")\n");
 #ifdef __APPLE__
     if (getenv("TMUX")) {

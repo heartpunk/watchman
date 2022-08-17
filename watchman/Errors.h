@@ -96,49 +96,72 @@ class inotify_category : public std::error_category {
 // Obtain a ref to the above error category
 const std::error_category& inotify_category();
 
-class CommandValidationError : public std::runtime_error {
+template <typename T>
+class WatchmanError : public std::runtime_error {
+  struct NoPrefix {};
+
  public:
+  WatchmanError(const char* what)
+      : std::runtime_error{
+            T::prefix ? fmt::format("{}: {}", T::prefix, what).c_str()
+                      : what} {}
+  WatchmanError(const std::string& what)
+      : std::runtime_error{
+            T::prefix ? fmt::format("{}: {}", T::prefix, what).c_str()
+                      : what} {}
+  WatchmanError(NoPrefix, const std::string& what) : std::runtime_error{what} {}
+
+  using std::runtime_error::runtime_error;
+
   template <typename... Args>
-  explicit CommandValidationError(Args&&... args)
-      : std::runtime_error(folly::to<std::string>(
-            "failed to validate command: ",
-            std::forward<Args>(args)...)) {}
+  [[noreturn]] static void throwf(
+      fmt::format_string<Args...> fmt,
+      Args&&... args) {
+    if constexpr (nullptr != T::prefix) {
+      // It would be nice to avoid the double-format here.
+      throw T{
+          NoPrefix{},
+          fmt::format(
+              "{}: {}",
+              T::prefix,
+              fmt::format(fmt, std::forward<Args>(args)...))};
+    } else {
+      throw T{NoPrefix{}, fmt::format(fmt, std::forward<Args>(args)...)};
+    }
+  }
+};
+
+class CommandValidationError : public WatchmanError<CommandValidationError> {
+ public:
+  static constexpr const char* prefix = "failed to validate command";
+  using WatchmanError::WatchmanError;
 };
 
 /**
  * Represents an error parsing a query.
  */
-class QueryParseError : public std::runtime_error {
+class QueryParseError : public WatchmanError<QueryParseError> {
  public:
-  template <typename... Args>
-  explicit QueryParseError(Args&&... args)
-      : std::runtime_error(folly::to<std::string>(
-            "failed to parse query: ",
-            std::forward<Args>(args)...)) {}
+  static constexpr const char* prefix = "failed to parse query";
+  using WatchmanError::WatchmanError;
 };
 
 /**
  * Represents an error executing a query.
  */
-class QueryExecError : public std::runtime_error {
+class QueryExecError : public WatchmanError<QueryExecError> {
  public:
-  template <typename... Args>
-  explicit QueryExecError(Args&&... args)
-      : std::runtime_error(folly::to<std::string>(
-            "query failed: ",
-            std::forward<Args>(args)...)) {}
+  static constexpr const char* prefix = "query failed";
+  using WatchmanError::WatchmanError;
 };
 
 /**
  * Represents an error resolving a root.
  */
-class RootResolveError : public std::runtime_error {
+class RootResolveError : public WatchmanError<RootResolveError> {
  public:
-  template <typename... Args>
-  explicit RootResolveError(Args&&... args)
-      : std::runtime_error(folly::to<std::string>(
-            "RootResolveError: ",
-            std::forward<Args>(args)...)) {}
+  static constexpr const char* prefix = "failed to resolve root";
+  using WatchmanError::WatchmanError;
 };
 
 } // namespace watchman

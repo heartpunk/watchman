@@ -41,7 +41,7 @@ void ClientStateAssertions::queueAssertion(
 }
 
 json_ref ClientStateAssertions::debugStates() const {
-  auto states = json_array();
+  std::vector<json_ref> states;
   for (const auto& state_q : states_) {
     for (const auto& state : state_q.second) {
       auto obj = json_object();
@@ -60,10 +60,10 @@ json_ref ClientStateAssertions::debugStates() const {
           obj.set("state", w_string_to_json("Done"));
           break;
       }
-      json_array_append(states, obj);
+      states.push_back(std::move(obj));
     }
   }
-  return states;
+  return json_array(std::move(states));
 }
 
 bool ClientStateAssertions::removeAssertion(
@@ -94,8 +94,8 @@ bool ClientStateAssertions::removeAssertion(
         if (front->disposition == ClientStateDisposition::Asserted &&
             front->enterPayload) {
           front->root->unilateralResponses->enqueue(
-              std::move(front->enterPayload));
-          front->enterPayload = nullptr;
+              std::move(*front->enterPayload));
+          front->enterPayload = std::nullopt;
         }
       }
       return true;
@@ -135,7 +135,7 @@ bool ClientStateAssertions::isStateAsserted(w_string stateName) const {
 namespace {
 
 json_ref getIgnoreVcs(const Configuration& config) {
-  json_ref ignores = config.get("ignore_vcs");
+  std::optional<json_ref> ignores = config.get("ignore_vcs");
   if (!ignores) {
     // default to a well-known set of vcs's
     return json_array(
@@ -144,11 +144,11 @@ json_ref getIgnoreVcs(const Configuration& config) {
          typed_string_to_json(".hg")});
   }
 
-  if (!ignores.isArray()) {
+  if (!ignores->isArray()) {
     throw std::runtime_error("ignore_vcs must be an array of strings");
   }
 
-  return ignores;
+  return *ignores;
 }
 
 /**
@@ -197,11 +197,12 @@ IgnoreSet computeIgnoreSet(
   IgnoreSet result;
 
   if (auto ignores = config.get("ignore_dirs")) {
-    if (!ignores.isArray()) {
+    if (!ignores->isArray()) {
       logf(ERR, "ignore_dirs must be an array of strings\n");
     } else {
-      for (size_t i = 0; i < json_array_size(ignores); i++) {
-        auto jignore = json_array_get(ignores, i);
+      auto& arr = ignores->array();
+      for (size_t i = 0; i < arr.size(); i++) {
+        auto& jignore = arr[i];
 
         if (!jignore.isString()) {
           logf(ERR, "ignore_dirs must be an array of strings\n");
@@ -239,7 +240,7 @@ Root::Root(
     FileSystem& fileSystem,
     const w_string& root_path,
     const w_string& fs_type,
-    json_ref config_file,
+    std::optional<json_ref> config_file,
     Configuration config_,
     std::shared_ptr<QueryableView> view,
     SaveGlobalStateHook saveGlobalStateHook)
@@ -247,6 +248,7 @@ Root::Root(
       cookies(
           fileSystem,
           computeCookieDir(root_path, config_, case_sensitive, ignore)),
+      enable_parallel_crawl{config_.getBool("enable_parallel_crawl", false)},
       config_file(std::move(config_file)),
       config(std::move(config_)),
       trigger_settle(int(config.getInt("settle", kDefaultSettlePeriod))),

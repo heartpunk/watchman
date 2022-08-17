@@ -28,7 +28,7 @@ class QueryableView : public std::enable_shared_from_this<QueryableView> {
    */
   const bool requiresCrawl;
 
-  explicit QueryableView(bool requiresCrawl) : requiresCrawl{requiresCrawl} {}
+  QueryableView(const w_string& root_path, bool requiresCrawl);
   virtual ~QueryableView();
 
   /**
@@ -48,7 +48,7 @@ class QueryableView : public std::enable_shared_from_this<QueryableView> {
 
   virtual ClockPosition getMostRecentRootNumberAndTickValue() const = 0;
   virtual w_string getCurrentClockString() const = 0;
-  virtual uint32_t getLastAgeOutTickValue() const;
+  virtual ClockTicks getLastAgeOutTickValue() const;
   virtual std::chrono::system_clock::time_point getLastAgeOutTimeStamp() const;
   virtual void ageOut(PerfSample& sample, std::chrono::seconds minAge);
 
@@ -57,6 +57,15 @@ class QueryableView : public std::enable_shared_from_this<QueryableView> {
   virtual CookieSync::SyncResult syncToNow(
       const std::shared_ptr<Root>& root,
       std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * Synchronize this view with the working copy.
+   *
+   * The returned future will complete when this view caught up with all the
+   * writes to the working copy.
+   */
+  virtual folly::SemiFuture<CookieSync::SyncResult> sync(
+      const std::shared_ptr<Root>& root) = 0;
 
   // Specialized query function that is used to test whether
   // version control files exist as part of some settling handling.
@@ -87,6 +96,12 @@ class QueryableView : public std::enable_shared_from_this<QueryableView> {
   waitUntilReadyToQuery() = 0;
 
   // Return the SCM detected for this watched root
-  virtual SCM* getSCM() const = 0;
+  SCM* getSCM() const {
+    return scm_.get();
+  }
+
+ private:
+  // The source control system that we detected during initialization
+  std::unique_ptr<SCM> scm_;
 };
 } // namespace watchman

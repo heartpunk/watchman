@@ -12,6 +12,7 @@
 #include "watchman/Logging.h"
 #include "watchman/fs/FileDescriptor.h"
 #include "watchman/fs/Pipe.h"
+#include "watchman/portability/WinError.h"
 #include "watchman/watchman_stream.h"
 
 #ifdef HAVE_UCRED_H
@@ -24,8 +25,6 @@
 #include <sys/socket.h> // @manual
 #endif
 
-using watchman::FileDescriptor;
-using watchman::Pipe;
 using namespace watchman;
 
 static const int kWriteTimeout = 60000;
@@ -225,7 +224,7 @@ class UnixStream : public watchman_stream {
     return x.value();
   }
 
-  w_evt_t getEvents() override {
+  watchman_event* getEvents() override {
     return &evt;
   }
 
@@ -312,7 +311,7 @@ std::unique_ptr<watchman_event> w_event_make_sockets() {
 }
 
 #define MAX_POLL_EVENTS 63 // Must match MAXIMUM_WAIT_OBJECTS-1 on win
-int w_poll_events_sockets(struct watchman_event_poll* p, int n, int timeoutms) {
+int w_poll_events_sockets(EventPoll* p, int n, int timeoutms) {
   struct pollfd pfds[MAX_POLL_EVENTS];
   int i;
   int res;
@@ -357,7 +356,7 @@ std::unique_ptr<watchman_stream> w_stm_fdopen(FileDescriptor&& fd) {
   return std::make_unique<UnixStream>(std::move(fd));
 }
 
-std::unique_ptr<watchman_stream> w_stm_connect_unix(
+ResultErrno<std::unique_ptr<watchman_stream>> w_stm_connect_unix(
     const char* path,
     int timeoutms) {
   struct sockaddr_un un {};
@@ -366,8 +365,7 @@ std::unique_ptr<watchman_stream> w_stm_connect_unix(
 
   if (strlen(path) >= sizeof(un.sun_path) - 1) {
     logf(ERR, "w_stm_connect_unix({}) path is too long\n", path);
-    errno = E2BIG;
-    return NULL;
+    return E2BIG;
   }
 
   FileDescriptor fd(
@@ -380,7 +378,7 @@ std::unique_ptr<watchman_stream> w_stm_connect_unix(
           0),
       FileDescriptor::FDType::Socket);
   if (!fd) {
-    return nullptr;
+    return errno;
   }
   fd.setCloExec();
 
@@ -405,8 +403,7 @@ retry_connect:
       }
     }
 
-    errno = err;
-    return nullptr;
+    return err;
   }
 
   int bufsize = WATCHMAN_IO_BUF_SIZE;
@@ -417,7 +414,7 @@ retry_connect:
       reinterpret_cast<const char*>(&bufsize),
       sizeof(bufsize));
 
-  return w_stm_fdopen(std::move(fd));
+  return ResultErrno<std::unique_ptr<Stream>>{w_stm_fdopen(std::move(fd))};
 }
 
 #ifndef _WIN32

@@ -9,7 +9,6 @@
 import os
 from typing import Optional
 
-from . import WatchmanInstance
 from . import WatchmanTestCase
 
 
@@ -41,7 +40,6 @@ except ImportError:
 
     class WatchmanEdenTestCase(object):
         pass
-
 
 else:
 
@@ -78,8 +76,7 @@ else:
 
             self.system_hgrc = None
 
-            self.eden_watchman = WatchmanInstance.Instance()
-            self.eden_watchman.start()
+            self.eden_watchman = self.watchmanInstance()
             self.addCleanup(self.cleanUpWatchman)
 
             self.client = self.getClient(self.eden_watchman)
@@ -140,4 +137,4 @@ else:
             return hgrepo.HgRepository(path, system_hgrc=self.system_hgrc)
 
         def setDefaultConfiguration(self):
-            self.setConfiguration("local", "bser")
+            self.setConfiguration("local", "bser", False)

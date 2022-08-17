@@ -18,14 +18,13 @@
 #include "watchman/query/QueryContext.h"
 #include "watchman/query/eval.h"
 #include "watchman/root/Root.h"
-#include "watchman/scm/SCM.h"
 #include "watchman/thirdparty/wildmatch/wildmatch.h"
 #include "watchman/watcher/Watcher.h"
 #include "watchman/watchman_file.h"
 
 // Each root gets a number that uniquely identifies it within the process. This
 // helps avoid confusion if a root is removed and then added again.
-static std::atomic<long> next_root_number{1};
+static std::atomic<watchman::ClockRoot> next_root_number{1};
 
 namespace watchman {
 
@@ -469,7 +468,7 @@ InMemoryView::InMemoryView(
     const w_string& root_path,
     Configuration config,
     std::shared_ptr<Watcher> watcher)
-    : QueryableView{/*requiresRecrawl=*/true},
+    : QueryableView{root_path, /*requiresCrawl=*/true},
       fileSystem_{fileSystem},
       config_(std::move(config)),
       view_(folly::in_place, root_path),
@@ -487,8 +486,7 @@ InMemoryView::InMemoryView(
       maxFilesToWarmInContentCache_(
           size_t(config_.getInt("content_hash_max_warm_per_settle", 1024))),
       syncContentCacheWarming_(
-          config_.getBool("content_hash_warm_wait_before_settle", false)),
-      scm_(SCM::scmForPath(root_path)) {
+          config_.getBool("content_hash_warm_wait_before_settle", false)) {
   json_int_t in_memory_view_ring_log_size =
       config_.getInt("in_memory_view_ring_log_size", 0);
   if (in_memory_view_ring_log_size) {
@@ -890,11 +888,9 @@ void InMemoryView::globGenerator(const Query* query, QueryContext* ctx) const {
 
   const auto dir = view->resolveDir(relative_root);
   if (!dir) {
-    throw QueryExecError(folly::to<std::string>(
-        "glob_generator could not resolve ",
-        relative_root.view(),
-        ", check your "
-        "relative_root parameter!"));
+    QueryExecError::throwf(
+        "glob_generator could not resolve {}, check your relative_root parameter!",
+        relative_root);
   }
 
   globGeneratorTree(ctx, query->glob_tree.get(), dir);
@@ -930,7 +926,7 @@ w_string InMemoryView::getCurrentClockString() const {
   return w_string(clockbuf, W_STRING_UNICODE);
 }
 
-uint32_t InMemoryView::getLastAgeOutTickValue() const {
+ClockTicks InMemoryView::getLastAgeOutTickValue() const {
   return lastAgeOutTick_;
 }
 
@@ -1041,6 +1037,11 @@ CookieSync::SyncResult InMemoryView::syncToNow(
   }
 
   return syncResult;
+}
+
+folly::SemiFuture<CookieSync::SyncResult> InMemoryView::sync(
+    const std::shared_ptr<Root>& root) {
+  return root->cookies.sync();
 }
 
 CookieSync::SyncResult InMemoryView::syncToNowCookies(
@@ -1165,10 +1166,11 @@ void InMemoryView::clearWatcherDebugInfo() {
 json_ref InMemoryView::getViewDebugInfo() const {
   auto processedPathsResult = json_null();
   if (processedPaths_) {
-    processedPathsResult = json_array();
+    std::vector<json_ref> paths;
     for (auto& entry : processedPaths_->readAll()) {
-      json_array_append(processedPathsResult, entry.asJsonValue());
+      paths.push_back(entry.asJsonValue());
     }
+    processedPathsResult = json_array(std::move(paths));
   }
   return json_object({
       {"processed_paths", processedPathsResult},
@@ -1179,10 +1181,6 @@ void InMemoryView::clearViewDebugInfo() {
   if (processedPaths_) {
     processedPaths_->clear();
   }
-}
-
-SCM* InMemoryView::getSCM() const {
-  return scm_.get();
 }
 
 void InMemoryView::warmContentCache() {

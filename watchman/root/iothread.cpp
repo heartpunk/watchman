@@ -9,6 +9,7 @@
 #include <chrono>
 #include "watchman/Errors.h"
 #include "watchman/InMemoryView.h"
+#include "watchman/fs/ParallelWalk.h"
 #include "watchman/root/Root.h"
 #include "watchman/root/warnerr.h"
 #include "watchman/watcher/Watcher.h"
@@ -39,6 +40,9 @@ void InMemoryView::fullCrawl(
   // can get stuck with an empty view until another change is observed
   mostRecentTick_.fetch_add(1, std::memory_order_acq_rel);
 
+  fullCrawlStatCount_ = std::make_shared<std::atomic<size_t>>(0);
+  root->recrawlInfo.wlock()->statCount = fullCrawlStatCount_;
+
   auto start = std::chrono::system_clock::now();
   pendingFromWatcher.lock()->add(root->root_path, start, W_PENDING_RECURSIVE);
   while (true) {
@@ -63,6 +67,8 @@ void InMemoryView::fullCrawl(
   auto recrawlInfo = root->recrawlInfo.wlock();
   recrawlInfo->shouldRecrawl = false;
   recrawlInfo->crawlFinish = std::chrono::steady_clock::now();
+  recrawlInfo->statCount = nullptr;
+  fullCrawlStatCount_ = nullptr;
   root->inner.done_initial.store(true, std::memory_order_release);
 
   // There is no need to hold locks while logging, and abortAllCookies resolves
@@ -344,7 +350,7 @@ void InMemoryView::processPath(
     ViewDatabase& view,
     PendingChanges& coll,
     const PendingChange& pending,
-    const DirEntry* pre_stat,
+    const FileInformation* pre_stat,
     std::vector<w_string>& pendingCookies) {
   w_check(
       pending.path.size() >= rootPath_.size(),
@@ -457,10 +463,19 @@ void InMemoryView::crawler(
       }
     } catch (const std::system_error& err) {
       handle_open_errno(
-          *root, dir, pending.now, "getFileInformation", err.code());
+          *root,
+          dir->getFullPath(),
+          pending.now,
+          "getFileInformation",
+          err.code());
       view.markDirDeleted(*watcher_, dir, getClock(pending.now), true);
       return;
     }
+  }
+
+  if (recursive &&
+      root->enable_parallel_crawl.load(std::memory_order_acquire)) {
+    return crawlerParallel(root, view, coll, pending, pendingCookies);
   }
 
   auto& path = pending.path;
@@ -474,10 +489,11 @@ void InMemoryView::crawler(
   std::unique_ptr<DirHandle> osdir;
 
   try {
-    osdir = watcher_->startWatchDir(root, dir, path.c_str());
+    osdir = watcher_->startWatchDir(root, path.c_str());
   } catch (const std::system_error& err) {
     logf(DBG, "startWatchDir({}) threw {}\n", path, err.what());
-    handle_open_errno(*root, dir, pending.now, "opendir", err.code());
+    handle_open_errno(
+        *root, dir->getFullPath(), pending.now, "opendir", err.code());
     view.markDirDeleted(*watcher_, dir, getClock(pending.now), true);
     return;
   }
@@ -544,7 +560,13 @@ void InMemoryView::crawler(
             newFlags.asRaw());
 
         PendingChange full_pending{std::move(full_path), pending.now, newFlags};
-        processPath(root, view, coll, full_pending, dirent, pendingCookies);
+        processPath(
+            root,
+            view,
+            coll,
+            full_pending,
+            dirent->has_stat ? &dirent->stat : nullptr,
+            pendingCookies);
       }
     }
   } catch (const std::system_error& exc) {
@@ -569,6 +591,177 @@ void InMemoryView::crawler(
           file->getName().data(),
           pending.now,
           recursive ? W_PENDING_RECURSIVE : PendingFlags{});
+    }
+  }
+}
+
+namespace {
+
+// Handle ignore and startWatchDir on openDir.
+class CrawlerFileSystem : public FileSystem {
+ public:
+  std::unique_ptr<DirHandle> openDir(const char* path, bool strict) override {
+    // startWatchDir implementations use default openDir, which has
+    // strict=true.
+    w_assert(strict, "CrawlerFileSystem::openDir requires strict=true");
+    (void)strict;
+    // Match ignore handling in statPath().
+    w_string fullPath{path};
+    if (root_->ignore.isIgnoreDir(fullPath)) {
+      return nullptr;
+    }
+    if ((root_->root_path != fullPath &&
+         root_->ignore.isIgnoreVCS(fullPath.dirName())) &&
+        !root_->cookies.isCookieDir(fullPath)) {
+      return nullptr;
+    }
+    // Use watcher->startWatchDir to ensure side effects are applied
+    // in the right order (ex. inotify_add_watch before opendir).
+    // This requires startWatchDir to be thread-safe.
+    return watcher_->startWatchDir(root_, path);
+  }
+
+  FileInformation getFileInformation(
+      const char* path,
+      CaseSensitivity caseSensitive) override {
+    return fileSystem_.getFileInformation(path, caseSensitive);
+  }
+
+  void touch(const char* path) override {
+    fileSystem_.touch(path);
+  }
+
+  CrawlerFileSystem(
+      FileSystem& fileSystem,
+      std::shared_ptr<Root> root,
+      std::shared_ptr<Watcher> watcher)
+      : fileSystem_{fileSystem},
+        root_{std::move(root)},
+        watcher_{std::move(watcher)} {}
+
+  CrawlerFileSystem() = delete;
+  CrawlerFileSystem(CrawlerFileSystem&&) = delete;
+  CrawlerFileSystem(const CrawlerFileSystem&) = delete;
+  CrawlerFileSystem& operator=(CrawlerFileSystem&&) = delete;
+  CrawlerFileSystem& operator=(const CrawlerFileSystem&) = delete;
+
+ private:
+  FileSystem& fileSystem_;
+  std::shared_ptr<Root> root_;
+  std::shared_ptr<Watcher> watcher_;
+};
+
+} // namespace
+
+void InMemoryView::crawlerParallel(
+    const std::shared_ptr<Root>& root,
+    ViewDatabase& view,
+    PendingChanges& coll,
+    const PendingChange& pending,
+    std::vector<w_string>& pendingCookies) {
+  w_assert(
+      pending.flags.contains(W_PENDING_RECURSIVE),
+      "crawlerParallel requires W_PENDING_RECURSIVE");
+
+  // Flags to pass down to statPath().
+  const PendingFlags inheritFlags =
+      (pending.flags & W_PENDING_IS_DESYNCED) | W_PENDING_VIA_PWALK;
+
+  AbsolutePath path{pending.path.c_str()};
+  logf(DBG, "crawlerParallel({})\n", path);
+
+  // Use ParallelWalker to get directory entries and stats recursively.
+  // Unlike crawler(), do not call the crawler function recursively
+  // (via W_PENDING_RECURSIVE), and avoid extra syscalls.
+
+  std::shared_ptr<CrawlerFileSystem> fs =
+      std::make_shared<CrawlerFileSystem>(fileSystem_, root, watcher_);
+  size_t threadCountHint = config_.getInt("parallel_crawl_thread_count", 0);
+  ParallelWalker walker{std::move(fs), path, threadCountHint};
+
+  // Step 1: Process readDir results.
+  while (true) {
+    auto result = walker.nextResult();
+    if (!result.has_value()) {
+      break;
+    }
+    ReadDirResult& dirResult = result.value();
+
+    // Step 1a: Prepare the dirView.
+    w_string dirPath{dirResult.dirFullPath.c_str()};
+    auto dirView = view.resolveDir(dirPath, true);
+    if (dirView->files.empty()) {
+      dirView->files.reserve(dirResult.entries.size());
+      dirView->dirs.reserve(dirResult.subdirCount);
+    }
+    for (auto& it : dirView->files) {
+      auto fileView = it.second.get();
+      if (fileView->exists) {
+        fileView->maybe_deleted = true;
+      }
+    }
+
+    // Step 1b: Update files in the dirView via statPath().
+    // Prepare the stat so statPath can avoid syscall.
+    for (auto& entry : dirResult.entries) {
+      w_string name{entry.name.c_str(), W_STRING_BYTE};
+      watchman_file* fileView = dirView->getChildFile(name);
+      if (fileView) {
+        fileView->maybe_deleted = false;
+      }
+      auto fullPath = dirView->getFullPathToChild(name);
+      processPath(
+          root,
+          view,
+          coll,
+          PendingChange{
+              std::move(fullPath),
+              pending.now,
+              inheritFlags,
+          },
+          &entry.stat,
+          pendingCookies);
+    }
+
+    // Step 1c: Mark for deletion.
+    for (auto& it : dirView->files) {
+      auto fileView = it.second.get();
+      if (fileView->exists && fileView->maybe_deleted) {
+        auto fullPath = dirView->getFullPathToChild(fileView->getName());
+        processPath(
+            root,
+            view,
+            coll,
+            PendingChange{
+                std::move(fullPath),
+                pending.now,
+                inheritFlags,
+            },
+            nullptr,
+            pendingCookies);
+      }
+    }
+  }
+
+  // Step 2: Handle errors.
+  while (true) {
+    auto maybe_error = walker.nextError();
+    if (!maybe_error) {
+      break;
+    }
+    auto error = maybe_error.value();
+    const std::system_error* exc =
+        error.error.get_exception<std::system_error>();
+    if (exc) {
+      auto code = exc->code();
+      if (code == error_code::no_such_file_or_directory ||
+          code == error_code::not_a_directory) {
+        // Handled by step 1c.
+      } else {
+        // Report error. Affect query response.
+        handle_open_errno(
+            *root, error.fullPath, pending.now, error.operationName, code);
+      }
     }
   }
 }
@@ -623,10 +816,13 @@ void InMemoryView::statPath(
     ViewDatabase& view,
     PendingChanges& coll,
     const PendingChange& pending,
-    const DirEntry* pre_stat) {
+    const FileInformation* pre_stat) {
   bool recursive = pending.flags.contains(W_PENDING_RECURSIVE);
   const bool via_notify = pending.flags.contains(W_PENDING_VIA_NOTIFY);
   const PendingFlags desynced_flag = pending.flags & W_PENDING_IS_DESYNCED;
+
+  // viaPwalk is true iff calling from crawlerParallel.
+  bool viaPwalk = pending.flags.contains(W_PENDING_VIA_PWALK);
 
   if (root.ignore.isIgnoreDir(pending.path)) {
     logf(DBG, "{} matches ignore_dir rules\n", pending.path);
@@ -646,8 +842,13 @@ void InMemoryView::statPath(
 
   FileInformation st;
   std::error_code errcode;
-  if (pre_stat && pre_stat->has_stat) {
-    st = pre_stat->stat;
+  if (pre_stat) {
+    st = *pre_stat;
+  } else if (viaPwalk) {
+    // crawlerParallel always provides "pre_stat". If it doesn't, it means the
+    // file is missing (see "Step 1c" in crawlerParallel). Treat as deleted
+    // without an extra getFileInformation() call.
+    errcode = make_error_code(error_code::no_such_file_or_directory);
   } else {
     try {
       st = fileSystem_.getFileInformation(path.c_str(), root.case_sensitive);
@@ -676,6 +877,10 @@ void InMemoryView::statPath(
 
   if (processedPaths_) {
     processedPaths_->write(PendingChangeLogEntry{pending, errcode, st});
+  }
+  if (fullCrawlStatCount_) {
+    // Not using loaded value - load can be relaxed - no need for acq_rel
+    fullCrawlStatCount_->fetch_add(1, std::memory_order_release);
   }
 
   if (errcode == error_code::no_such_file_or_directory ||
@@ -721,11 +926,15 @@ void InMemoryView::statPath(
       view.markFileChanged(*watcher_, file, getClock(pending.now));
     }
 
-    if (root.case_sensitive == CaseSensitivity::CaseInSensitive &&
-        dir_name != root.root_path && parentDir->last_check_existed) {
+    if (!viaPwalk &&
+        (root.case_sensitive == CaseSensitivity::CaseInSensitive &&
+         dir_name != root.root_path && parentDir->last_check_existed)) {
       /* If we rejected the name because it wasn't canonical,
        * we need to ensure that we look in the parent dir to discover
-       * the new item(s) */
+       * the new item(s)
+       *
+       * Unless viaPwalk, in which case the siblings (items in parent dir)
+       * will be visited by crawlerParallel. */
       logf(
           DBG,
           "we're case insensitive, and {} is ENOENT, "
@@ -793,11 +1002,13 @@ void InMemoryView::statPath(
         dir_ent->last_check_existed = true;
       }
 
-      // Don't recurse if our parent is an ignore dir
-      if (!root.ignore.isIgnoreVCS(dir_name) ||
-          // but do if we're looking at the cookie dir (stat_path is never
-          // called for the root itself)
-          cookies.isCookieDir(pending.path)) {
+      // Don't recurse if our parent is an ignore dir or via crawlerParallel
+      // (already recursive)
+      if (!viaPwalk &&
+          (!root.ignore.isIgnoreVCS(dir_name) ||
+           // but do if we're looking at the cookie dir (stat_path is never
+           // called for the root itself)
+           cookies.isCookieDir(pending.path))) {
         if (recursive) {
           /* we always need to crawl if we're recursive, this can happen when a
            * directory is created */

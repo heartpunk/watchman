@@ -11,8 +11,8 @@ from typing import List
 from .builder import (
     AutoconfBuilder,
     Boost,
+    CMakeBootStrapBuilder,
     CMakeBuilder,
-    BistroBuilder,
     Iproute2Builder,
     MakeBuilder,
     NinjaBootstrap,
@@ -20,7 +20,6 @@ from .builder import (
     OpenNSABuilder,
     OpenSSLBuilder,
     SqliteBuilder,
-    CMakeBootStrapBuilder,
 )
 from .cargo import CargoBuilder
 from .expr import parse_expr
@@ -66,6 +65,8 @@ SCHEMA = {
             "make_binary": OPTIONAL,
             "build_in_src_dir": OPTIONAL,
             "job_weight_mib": OPTIONAL,
+            "patchfile": OPTIONAL,
+            "patchfile_opts": OPTIONAL,
         },
     },
     "msbuild": {"optional_section": True, "fields": {"project": REQUIRED}},
@@ -102,6 +103,8 @@ SCHEMA = {
     "shipit.pathmap": {"optional_section": True},
     "shipit.strip": {"optional_section": True},
     "install.files": {"optional_section": True},
+    # fb-only
+    "sandcastle": {"optional_section": True, "fields": {"run_tests": OPTIONAL}},
 }
 
 # These sections are allowed to vary for different platforms
@@ -531,16 +534,6 @@ class ManifestParser(object):
             if extra_b2_args is not None:
                 args += extra_b2_args
             return Boost(build_options, ctx, self, src_dir, build_dir, inst_dir, args)
-
-        if builder == "bistro":
-            return BistroBuilder(
-                build_options,
-                ctx,
-                self,
-                src_dir,
-                build_dir,
-                inst_dir,
-            )
 
         if builder == "cmake":
             defines = self.get_section_as_dict("cmake.defines", ctx)

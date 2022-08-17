@@ -14,7 +14,8 @@
 
 namespace watchman {
 
-using ClockTicks = uint32_t;
+using ClockTicks = uint64_t;
+using ClockRoot = uint64_t;
 
 struct ClockStamp {
   ClockTicks ticks;
@@ -45,14 +46,23 @@ struct QuerySince {
   bool is_fresh_instance() const {
     return std::get<Clock>(since).is_fresh_instance;
   }
+
+  /**
+   * Set the clock to a fresh instance.
+   *
+   * Throws if this holds a Timestamp.
+   */
+  void set_fresh_instance() {
+    std::get<Clock>(since).is_fresh_instance = true;
+  }
 };
 
 struct ClockPosition {
-  uint32_t rootNumber{0};
+  ClockRoot rootNumber{0};
   ClockTicks ticks{0};
 
   ClockPosition() = default;
-  ClockPosition(uint32_t rootNumber, ClockTicks ticks)
+  ClockPosition(ClockRoot rootNumber, ClockTicks ticks)
       : rootNumber(rootNumber), ticks(ticks) {}
 
   w_string toClockString() const;
@@ -79,7 +89,7 @@ struct ClockSpec {
   w_string scmMergeBase;
   w_string scmMergeBaseWith;
   // Optional saved state parameters
-  json_ref savedStateConfig;
+  std::optional<json_ref> savedStateConfig;
   w_string savedStateStorageType;
   w_string savedStateCommitId;
 
@@ -126,7 +136,7 @@ struct ClockSpec {
 } // namespace watchman
 
 bool clock_id_string(
-    uint32_t root_number,
+    watchman::ClockRoot root_number,
     watchman::ClockTicks ticks,
     char* buf,
     size_t bufsize);

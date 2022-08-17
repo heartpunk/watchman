@@ -10,9 +10,11 @@
 // don't show deprecation warnings about NewField when we build this file
 #![allow(deprecated)]
 
-use crate::prelude::*;
-use serde::Deserialize;
 use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use crate::prelude::*;
 
 /// This trait is used to furnish the caller with the watchman
 /// field name for an entry in the file results
@@ -48,6 +50,15 @@ macro_rules! define_field {(
         }
 
         impl $tyname {
+            /// Fields should only be consumed when constructed via a QueryResult.
+            /// This constructor is provided for users to easily mock out
+            /// QueryResult objects in tests.
+            pub fn new(val: $ty) -> Self {
+                $tyname {
+                    val,
+                }
+            }
+
             /// Consumes the field and returns the underlying
             /// value storage
             pub fn into_inner(self) -> $ty {

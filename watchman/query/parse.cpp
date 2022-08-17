@@ -19,12 +19,12 @@ namespace watchman {
 namespace {
 
 bool parse_since(Query* res, const json_ref& query) {
-  auto since = query.get_default("since");
+  auto since = query.get_optional("since");
   if (!since) {
     return true;
   }
 
-  auto spec = ClockSpec::parseOptionalClockSpec(since);
+  auto spec = ClockSpec::parseOptionalClockSpec(*since);
   if (spec) {
     // res owns the ref to spec
     res->since_spec = std::move(spec);
@@ -37,23 +37,23 @@ bool parse_since(Query* res, const json_ref& query) {
 bool parse_paths(Query* res, const json_ref& query) {
   size_t i;
 
-  auto paths = query.get_default("path");
+  auto paths = query.get_optional("path");
   if (!paths) {
     return true;
   }
 
-  if (!paths.isArray()) {
+  if (!paths->isArray()) {
     throw QueryParseError("'path' must be an array");
   }
 
-  auto size = json_array_size(paths);
+  auto size = json_array_size(*paths);
 
   res->paths.emplace();
   std::vector<QueryPath>& res_paths = *res->paths;
   res_paths.resize(size);
 
   for (i = 0; i < size; i++) {
-    const auto& ele = paths.at(i);
+    const auto& ele = paths->at(i);
     w_string name;
 
     res_paths[i].depth = -1;
@@ -86,16 +86,16 @@ void parse_relative_root(
     const std::shared_ptr<Root>& root,
     Query* res,
     const json_ref& query) {
-  auto relative_root = query.get_default("relative_root");
+  auto relative_root = query.get_optional("relative_root");
   if (!relative_root) {
     return;
   }
 
-  if (!relative_root.isString()) {
+  if (!relative_root->isString()) {
     throw QueryParseError("'relative_root' must be a string");
   }
 
-  auto path = json_to_w_string(relative_root).normalizeSeparators();
+  auto path = json_to_w_string(*relative_root).normalizeSeparators();
   if (path.empty()) {
     // An empty relative_root is equivalent to not specifying
     // a relative root.  Importantly, we want to avoid setting
@@ -110,26 +110,26 @@ void parse_relative_root(
 }
 
 void parse_query_expression(Query* res, const json_ref& query) {
-  auto exp = query.get_default("expression");
+  auto exp = query.get_optional("expression");
   if (!exp) {
     // Empty expression means that we emit all generated files
     return;
   }
 
-  res->expr = parseQueryExpr(res, exp);
+  res->expr = parseQueryExpr(res, *exp);
 }
 
 void parse_request_id(Query* res, const json_ref& query) {
-  auto request_id = query.get_default("request_id");
+  auto request_id = query.get_optional("request_id");
   if (!request_id) {
     return;
   }
 
-  if (!request_id.isString()) {
+  if (!request_id->isString()) {
     throw QueryParseError("'request_id' must be a string");
   }
 
-  res->request_id = json_to_w_string(request_id);
+  res->request_id = json_to_w_string(*request_id);
 }
 
 namespace {
@@ -146,13 +146,13 @@ json_int_t parse_nonnegative_integer(std::string_view name, json_ref v) {
 } // namespace
 
 void parse_sync(Query* res, const json_ref& query) {
-  auto settle_period = query.get_default("settle_period");
-  auto settle_timeout = query.get_default("settle_timeout");
+  auto settle_period = query.get_optional("settle_period");
+  auto settle_timeout = query.get_optional("settle_timeout");
   if (settle_period && settle_timeout) {
     auto settle_period_value =
-        parse_nonnegative_integer("settle_period", settle_period);
+        parse_nonnegative_integer("settle_period", *settle_period);
     auto settle_timeout_value =
-        parse_nonnegative_integer("settle_timeout", settle_timeout);
+        parse_nonnegative_integer("settle_timeout", *settle_timeout);
     Query::SettleTimeouts settle_timeouts;
     settle_timeouts.settle_period =
         std::chrono::milliseconds{settle_period_value};
@@ -234,12 +234,12 @@ void parse_always_include_directories(Query* res, const json_ref& query) {
 
 void parse_benchmark(Query* res, const json_ref& query) {
   // Preserve behavior by supporting a boolean value. Also support int values.
-  auto bench = query.get_default("bench");
+  auto bench = query.get_optional("bench");
   if (bench) {
-    if (bench.isBool()) {
+    if (bench->isBool()) {
       res->bench_iterations = 100;
     } else {
-      res->bench_iterations = bench.asInt();
+      res->bench_iterations = bench->asInt();
     }
   }
 }
@@ -292,7 +292,7 @@ std::shared_ptr<Query> parseQuery(
 
   parse_request_id(res, query);
 
-  parse_field_list(query.get_default("fields"), &res->fieldList);
+  parse_field_list(query.get_optional("fields"), &res->fieldList);
 
   res->query_spec = query;
 
@@ -300,6 +300,9 @@ std::shared_ptr<Query> parseQuery(
 }
 
 void w_query_legacy_field_list(QueryFieldList* flist) {
+  // TODO: Avoid the round-trip through json_ref and insert the requested fields
+  // into QueryFieldList directly.
+
   static const char* names[] = {
       "name",
       "exists",
@@ -316,14 +319,13 @@ void w_query_legacy_field_list(QueryFieldList* flist) {
       "cclock",
       "oclock"};
   uint8_t i;
-  auto list = json_array();
+  std::vector<json_ref> list;
 
   for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-    json_array_append_new(
-        list, typed_string_to_json(names[i], W_STRING_UNICODE));
+    list.push_back(typed_string_to_json(names[i], W_STRING_UNICODE));
   }
 
-  parse_field_list(list, flist);
+  parse_field_list(json_array(std::move(list)), flist);
 }
 
 // Translate from the legacy array into the new style, then
@@ -340,15 +342,18 @@ std::shared_ptr<Query> parseQueryLegacy(
   bool negated = false;
   uint32_t i;
   const char* term_name = "match";
-  json_ref included, excluded;
+  std::vector<json_ref> included_array;
+  std::vector<json_ref> excluded_array;
   auto query_obj = json_object();
 
   if (!args.isArray()) {
     throw QueryParseError("Expected an array");
   }
 
-  for (i = start; i < json_array_size(args); i++) {
-    const char* arg = json_string_value(json_array_get(args, i));
+  auto& args_array = args.array();
+
+  for (i = start; i < args_array.size(); i++) {
+    const char* arg = json_string_value(args_array[i]);
     if (!arg) {
       /* not a string value! */
       throw QueryParseError(folly::to<std::string>(
@@ -357,7 +362,7 @@ std::shared_ptr<Query> parseQueryLegacy(
   }
 
   for (i = start; i < json_array_size(args); i++) {
-    const char* arg = json_string_value(json_array_get(args, i));
+    const char* arg = json_string_value(args_array[i]);
     if (!strcmp(arg, "--")) {
       i++;
       break;
@@ -384,19 +389,19 @@ std::shared_ptr<Query> parseQueryLegacy(
     }
 
     // Which group are we going to file it into
-    json_ref container;
+    std::vector<json_ref>* container;
     if (include) {
-      if (!included) {
-        included =
-            json_array({typed_string_to_json("anyof", W_STRING_UNICODE)});
+      if (included_array.empty()) {
+        included_array.push_back(
+            typed_string_to_json("anyof", W_STRING_UNICODE));
       }
-      container = included;
+      container = &included_array;
     } else {
-      if (!excluded) {
-        excluded =
-            json_array({typed_string_to_json("anyof", W_STRING_UNICODE)});
+      if (excluded_array.empty()) {
+        excluded_array.push_back(
+            typed_string_to_json("anyof", W_STRING_UNICODE));
       }
-      container = excluded;
+      container = &excluded_array;
     }
 
     auto term = json_array(
@@ -406,22 +411,30 @@ std::shared_ptr<Query> parseQueryLegacy(
     if (negated) {
       term = json_array({typed_string_to_json("not", W_STRING_UNICODE), term});
     }
-    json_array_append_new(container, std::move(term));
+    container->push_back(std::move(term));
 
     // Reset negated flag
     negated = false;
     term_name = "match";
   }
 
-  if (excluded) {
-    excluded =
-        json_array({typed_string_to_json("not", W_STRING_UNICODE), excluded});
+  std::optional<json_ref> included = included_array.empty()
+      ? std::nullopt
+      : std::make_optional(json_array(std::move(included_array)));
+
+  std::optional<json_ref> excluded;
+  if (!excluded_array.empty()) {
+    excluded = json_array(
+        {typed_string_to_json("not", W_STRING_UNICODE),
+         json_array(std::move(excluded_array))});
   }
 
-  json_ref query_array;
+  std::optional<json_ref> query_array;
   if (included && excluded) {
     query_array = json_array(
-        {typed_string_to_json("allof", W_STRING_UNICODE), excluded, included});
+        {typed_string_to_json("allof", W_STRING_UNICODE),
+         *excluded,
+         *included});
   } else if (included) {
     query_array = included;
   } else {
@@ -432,7 +445,7 @@ std::shared_ptr<Query> parseQueryLegacy(
   // Otherwise, it is the expression we want to use.
   if (query_array) {
     json_object_set_new_nocheck(
-        query_obj, "expression", std::move(query_array));
+        query_obj, "expression", std::move(*query_array));
   }
 
   // For trigger

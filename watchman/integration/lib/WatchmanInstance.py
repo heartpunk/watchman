@@ -6,6 +6,7 @@
 
 
 import atexit
+import hashlib
 import json
 import os
 import signal
@@ -30,28 +31,25 @@ except ImportError:
 tls = threading.local()
 
 
-def setSharedInstance(inst) -> None:
+def getSharedInstance(config=None):
+    config_hash = hashlib.sha1(json.dumps(config).encode()).hexdigest()
+    attr = f"instance_{config_hash}"
     global tls
-    # pyre-fixme[16]: `local` has no attribute `instance`.
-    tls.instance = inst
-    atexit.register(lambda: inst.stop())
+    inst = getattr(tls, attr, None)
+    if inst is None:
+        # Ensure that the temporary dir is configured
+        TempDir.get_temp_dir().get_dir()
+        inst = Instance(config=config)
+        inst.start()
+        setattr(tls, attr, inst)
+        atexit.register(lambda inst=inst: inst.stop())
+    return inst
 
 
-def getSharedInstance():
-    global tls
-    if hasattr(tls, "instance"):
-        return tls.instance
-    # Ensure that the temporary dir is configured
-    TempDir.get_temp_dir().get_dir()
-    inst = Instance()
-    inst.start()
-    setSharedInstance(inst)
-    return tls.instance
-
-
-def hasSharedInstance() -> bool:
-    global tls
-    return hasattr(tls, "instance")
+def mergeTestConfig(config):
+    """Merge local config with test config specified via WATCHMAN_TEST_CONFIG"""
+    test_config = json.loads(os.getenv("WATCHMAN_TEST_CONFIG") or "{}")
+    return {**test_config, **(config or {})}
 
 
 class InitWithFilesMixin(object):
@@ -139,7 +137,7 @@ class _Instance(object):
         self.debug_watchman = debug_watchman
         # pyre-fixme[16]: `_Instance` has no attribute `cfg_file`.
         with open(self.cfg_file, "w") as f:
-            f.write(json.dumps(config or {}))
+            f.write(json.dumps(mergeTestConfig(config)))
 
     def __del__(self) -> None:
         self.stop()

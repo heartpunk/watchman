@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <string>
+#include <vector>
 
 namespace watchman {
 
@@ -21,8 +22,6 @@ struct Flags {
   int show_version = 0;
   std::string named_pipe_path;
   std::string unix_sock_name;
-  int enable_tcp = 0;
-  std::string tcp_host;
   std::string pid_file;
   int persistent = 0;
   int dont_save_state = 0;
@@ -31,6 +30,7 @@ struct Flags {
   std::string output_encoding;
   std::string server_encoding;
   int foreground = 0;
+  int yes_pretty = 0;
   int no_pretty = 0;
   int no_spawn = 0;
   int no_local = 0;
@@ -77,13 +77,14 @@ struct OptDesc {
 
 /**
  * Populates the globals in `flags`.
+ *
+ * Returns daemon-specific arguments.
  */
-void parseOptions(int* argcp, char*** argvp, char*** daemon_argv);
+std::vector<std::string> parseOptions(int* argcp, char*** argvp);
 
 // The following are largely for internal use.
 
 bool w_getopt(OptDesc* opts, int* argcp, char*** argvp, char*** daemon_argv);
 [[noreturn]] void usage(struct watchman_getopt* opts, FILE* where);
-void print_command_list_for_help(FILE* where);
 
 } // namespace watchman

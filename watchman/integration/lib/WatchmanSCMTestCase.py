@@ -10,45 +10,19 @@ import subprocess
 
 import pywatchman
 
-from . import WatchmanInstance
 from . import WatchmanTestCase
 
 
 STRING_TYPES = (str, bytes)
 
 
-class WatchmanSCMTestCase(WatchmanTestCase.WatchmanTestCase):
-    def __init__(self, methodName: str = "run") -> None:
-        super(WatchmanSCMTestCase, self).__init__(methodName)
-
-    def requiresPersistentSession(self) -> bool:
-        return True
-
-    def skipIfNoFSMonitor(self) -> None:
-        """cause the test to skip if fsmonitor is not available.
-        We don't call this via unittest.skip because we want
-        to have the skip message show the context"""
-        try:
-            out, err = self.hg(["help", "--extension", "fsmonitor"])
-        except Exception as e:
-            self.skipTest("fsmonitor is not available: %s" % str(e))
-        else:
-            out = out.decode("utf-8")
-            err = err.decode("utf-8")
-            fail_str = "failed to import extension"
-            if (fail_str in out) or (fail_str in err):
-                self.skipTest("hg configuration is broken: %s %s" % (out, err))
-
-    def checkOSApplicability(self) -> None:
-        if os.name == "nt":
-            self.skipTest("The order of events on Windows is funky")
-
+class HgMixin:
     def hg(self, args, cwd=None):
         env = dict(os.environ)
         env["HGPLAIN"] = "1"
         env["HGUSER"] = "John Smith <smith@example.com>"
         env["NOSCMLOG"] = "1"  # disable some instrumentation at FB
-        sockpath = WatchmanInstance.getSharedInstance().getSockPath()
+        sockpath = self.watchmanInstance().getSockPath()
         env["WATCHMAN_SOCK"] = sockpath.legacy_sockpath()
         p = subprocess.Popen(
             [
@@ -77,7 +51,34 @@ class WatchmanSCMTestCase(WatchmanTestCase.WatchmanTestCase):
 
         return out, err
 
-    def resolveCommitHash(self, revset, cwd=None):
+
+class WatchmanSCMTestCase(WatchmanTestCase.WatchmanTestCase, HgMixin):
+    def __init__(self, methodName: str = "run") -> None:
+        super(WatchmanSCMTestCase, self).__init__(methodName)
+
+    def requiresPersistentSession(self) -> bool:
+        return True
+
+    def skipIfNoFSMonitor(self) -> None:
+        """cause the test to skip if fsmonitor is not available.
+        We don't call this via unittest.skip because we want
+        to have the skip message show the context"""
+        try:
+            out, err = self.hg(["help", "--extension", "fsmonitor"])
+        except Exception as e:
+            self.skipTest("fsmonitor is not available: %s" % str(e))
+        else:
+            out = out.decode("utf-8")
+            err = err.decode("utf-8")
+            fail_str = "failed to import extension"
+            if (fail_str in out) or (fail_str in err):
+                self.skipTest("hg configuration is broken: %s %s" % (out, err))
+
+    def checkOSApplicability(self) -> None:
+        if os.name == "nt":
+            self.skipTest("The order of events on Windows is funky")
+
+    def resolveCommitHash(self, revset, cwd=None) -> str:
         return self.hg(args=["log", "-T", "{node}", "-r", revset], cwd=cwd)[0].decode(
             "utf-8"
         )

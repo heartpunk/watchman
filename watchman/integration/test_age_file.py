@@ -14,6 +14,7 @@ from watchman.integration.lib import WatchmanTestCase
 
 @WatchmanTestCase.expand_matrix
 class TestAgeOutFile(WatchmanTestCase.WatchmanTestCase):
+    @WatchmanTestCase.skip_for(transports=["cli"])
     def test_age_file(self) -> None:
         root = self.mkdtemp()
 
@@ -40,7 +41,7 @@ class TestAgeOutFile(WatchmanTestCase.WatchmanTestCase):
         # correctly aged out
         self.watchmanCommand("since", root, "n:foo")
         cursors = self.watchmanCommand("debug-show-cursors", root)
-        self.assertTrue("n:foo" in cursors["cursors"])
+        self.assertIn("n:foo", cursors["cursors"])
 
         os.unlink(os.path.join(root, "a", "file.txt"))
         shutil.rmtree(os.path.join(root, "a"))
@@ -63,7 +64,7 @@ class TestAgeOutFile(WatchmanTestCase.WatchmanTestCase):
 
         # Our cursor should have been collected
         cursors = self.watchmanCommand("debug-show-cursors", root)
-        self.assertFalse("n:foo" in cursors["cursors"])
+        self.assertNotIn("n:foo", cursors["cursors"])
 
         # Add a new file to the suffix list; this will insert at the head
         self.touchRelative(root, "c.txt")

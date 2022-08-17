@@ -5,17 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import json
 import os
 import shutil
+from typing import Any, Dict, Optional
 
 from watchman.integration.lib import WatchmanEdenTestCase
 
 
-def populate(repo) -> None:
+def populate(repo, threshold: Optional[int] = None) -> None:
     # We ignore ".hg" here just so some of the tests that list files don't have to
     # explicitly filter out the contents of this directory.  However, in most situations
     # the .hg directory normally should not be ignored.
-    repo.write_file(".watchmanconfig", '{"ignore_dirs":[".hg"]}')
+    config: Dict[str, Any] = {"ignore_dirs": [".hg"]}
+    config["eden_use_streaming_since"] = True
+    if threshold:
+        config["eden_file_count_threshold_for_fresh_instance"] = threshold
+    repo.write_file(".watchmanconfig", json.dumps(config))
     repo.write_file("hello", "hola\n")
     repo.write_file("adir/file", "foo!\n")
     repo.write_file("bdir/test.sh", "#!/bin/bash\necho test\n", mode=0o755)
@@ -228,14 +234,11 @@ class TestEdenSince(WatchmanEdenTestCase.WatchmanEdenTestCase):
 
         first_res = self.query_adir_change_since(root, first_clock)
 
-        # TODO(T104564495): fix this incorrect behavior.
-        # we are asserting some behavior that deviates from non eden watchman
-        # here: "adir" is an "f" type.
-        # watchman tries to check the type of a file after it gets the
-        # notification that that file changed. That is useless for removals.
-        # We will never be able to report the type of file removed on eden.
-        # We should fix this, but for now Watchman just reports unknown types
-        # as f.
+        # TODO(T104564495): Watchman reports removed directories as file
+        # removal. This is caused by EdenFS's Journal not knowing if a
+        # file/directory is removed, and thus this is reported to Watchman as
+        # an UNKNOWN file, which for removed files/directory will be reported
+        # as a removed file.
         self.assertQueryRepsonseEqual(
             [{"name": "adir", "type": "f"}, {"name": "adir/file", "type": "f"}],
             first_res["files"],
@@ -278,6 +281,59 @@ class TestEdenSince(WatchmanEdenTestCase.WatchmanEdenTestCase):
         second_res = self.query_adir_change_since(root, second_clock)
 
         self.assertQueryRepsonseEqual(
-            [{"name": "adir", "type": "f"}, {"name": "adir/file", "type": "f"}],
+            [{"name": "adir", "type": "d"}, {"name": "adir/file", "type": "f"}],
             second_res["files"],
         )
+
+    def test_eden_since_over_threshold(self) -> None:
+        root = self.makeEdenMount(lambda repo: populate(repo, 1))
+        repo = self.repoForPath(root)
+
+        res = self.watchmanCommand("watch", root)
+        self.assertEqual("eden", res["watcher"])
+
+        clock = self.watchmanCommand(
+            "clock",
+            root,
+        )["clock"]
+
+        def do_query(clock):
+            return self.watchmanCommand(
+                "query",
+                root,
+                {
+                    "expression": ["type", "f"],
+                    "empty_on_fresh_instance": True,
+                    "fields": ["name"],
+                    "since": clock,
+                },
+            )
+
+        shutil.rmtree(os.path.join(root, "bdir"))
+        repo.hg("addremove")
+        repo.commit("removal commit.")
+
+        clock = self.watchmanCommand(
+            "clock",
+            root,
+        )["clock"]
+
+        res = do_query(clock)
+        self.assertFalse(res["is_fresh_instance"])
+        clock = res["clock"]
+
+        repo.hg("prev")
+
+        # A couple of files changed, more than the threshold one 1 set in the
+        # configuration. This is expected to return a fresh instance.
+        res = do_query(clock)
+        self.assertTrue(res["is_fresh_instance"])
+        clock = res["clock"]
+
+        # Make sure that we detect newly edited files afterwards.
+        with open(os.path.join(root, "hello"), "w") as f:
+            f.write("hello\n")
+
+        res = do_query(clock)
+        self.assertFalse(res["is_fresh_instance"])
+        self.assertQueryRepsonseEqual(["hello"], res["files"])

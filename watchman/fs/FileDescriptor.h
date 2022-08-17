@@ -15,6 +15,7 @@ class w_string;
 namespace watchman {
 
 struct FileInformation;
+struct REPARSE_DATA_BUFFER;
 
 enum class CaseSensitivity {
   // The caller knows that the filesystem path(s) in question are
@@ -93,6 +94,7 @@ class FileDescriptor {
       int
 #endif
       ;
+
   enum class FDType {
     Unknown,
     Generic,
@@ -191,6 +193,12 @@ class FileDescriptor {
   /** Returns the symbolic link target */
   w_string readSymbolicLink() const;
 
+  /**
+   * Returns true if this FileDescriptor is connected to a tty device.
+   * Calls isatty() on unix and GetFileType on Windows.
+   */
+  bool isatty() const;
+
   /** read(2), but yielding a Result for system independent error reporting */
   Result<int, std::error_code> read(void* buf, int size) const;
 
@@ -201,6 +209,10 @@ class FileDescriptor {
   static const FileDescriptor& stdIn();
   static const FileDescriptor& stdOut();
   static const FileDescriptor& stdErr();
+
+#ifdef _WIN32
+  ULONG getReparseTag() const;
+#endif
 
  private:
   system_handle_type fd_{kInvalid};

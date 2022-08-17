@@ -14,12 +14,11 @@ import os.path
 import tempfile
 import time
 import unittest
+from typing import Any, Dict, List
 
 import pywatchman
 
-from . import Interrupt
-from . import TempDir
-from . import WatchmanInstance
+from . import Interrupt, TempDir, WatchmanInstance
 from .path_utils import norm_absolute_path, norm_relative_path
 
 
@@ -75,13 +74,18 @@ class TempDirPerTestMixin(unittest.TestCase):
     def mkdtemp(self, **kwargs):
         return norm_absolute_path(tempfile.mkdtemp(dir=self.tempdir, **kwargs))
 
-    def mktemp(self, prefix: str = ""):
+    def mktemp(self, prefix: str = "") -> str:
         f, name = tempfile.mkstemp(prefix=prefix, dir=self.tempdir)
         os.close(f)
         return name
 
 
+# pyre-ignore[13]: `WatchmanTestCase` has no attribute `transport`.
 class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
+    transport: str
+    encoding: str
+    parallelCrawl: bool
+
     def __init__(self, methodName: str = "run") -> None:
         super(WatchmanTestCase, self).__init__(methodName)
         # pyre-fixme[16]: `WatchmanTestCase` has no attribute `setDefaultConfiguration`.
@@ -90,13 +94,12 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
         self.attempt = 0
         # ASAN-enabled builds can be slower enough that we hit timeouts
         # with the default of 1 second
-        self.socketTimeout = 40.0
+        self.socketTimeout = 80.0
 
     def requiresPersistentSession(self) -> bool:
         return False
 
     def checkPersistentSession(self) -> None:
-        # pyre-fixme[16]: `WatchmanTestCase` has no attribute `transport`.
         if self.requiresPersistentSession() and self.transport == "cli":
             self.skipTest("need persistent session")
 
@@ -131,12 +134,10 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
         if inst or not hasattr(self, "client") or no_cache:
             client = pywatchman.client(
                 timeout=self.socketTimeout,
-                # pyre-fixme[16]: `WatchmanTestCase` has no attribute `transport`.
                 transport=self.transport,
-                # pyre-fixme[16]: `WatchmanTestCase` has no attribute `encoding`.
                 sendEncoding=self.encoding,
                 recvEncoding=self.encoding,
-                sockpath=(inst or WatchmanInstance.getSharedInstance()).getSockPath(),
+                sockpath=(inst or self.watchmanInstance()).getSockPath(),
             )
             if (not inst or replace_cached) and not no_cache:
                 # only cache the client if it points to the shared instance
@@ -161,16 +162,15 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
             self.client.close()
             delattr(self, "client")
 
-    def _getTempDirName(self):
+    def _getTempDirName(self) -> str:
         name = self._getLongTestID()
         if self.attempt > 0:
             name += "-%d" % self.attempt
         return name
 
     def _getLongTestID(self) -> str:
-        # pyre-fixme[16]: `WatchmanTestCase` has no attribute `transport`.
-        # pyre-fixme[16]: `WatchmanTestCase` has no attribute `encoding`.
-        return "%s.%s.%s" % (self.id(), self.transport, self.encoding)
+        parallel = "sp"[int(self.parallelCrawl)]
+        return "%s.%s.%s.%s" % (self.id(), self.transport, self.encoding, parallel)
 
     def run(self, result):
         if result is None:
@@ -199,7 +199,7 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
 
     def getLogSample(self) -> str:
         """used in CI to show the hopefully relevant log snippets"""
-        inst = WatchmanInstance.getSharedInstance()
+        inst = self.watchmanInstance()
 
         def tail(logstr, n):
             lines = logstr.split("\n")[-n:]
@@ -219,13 +219,12 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
         Returns the contents of the server log file as an array
         that has already been split by line.
         """
-        return WatchmanInstance.getSharedInstance().getServerLogContents().split("\n")
+        return self.watchmanInstance().getServerLogContents().split("\n")
 
-    def setConfiguration(self, transport, encoding) -> None:
-        # pyre-fixme[16]: `WatchmanTestCase` has no attribute `transport`.
+    def setConfiguration(self, transport, encoding, parallelCrawl) -> None:
         self.transport = transport
-        # pyre-fixme[16]: `WatchmanTestCase` has no attribute `encoding`.
         self.encoding = encoding
+        self.parallelCrawl = parallelCrawl
 
     def removeRelative(self, base, *fname) -> None:
         fname = os.path.join(base, *fname)
@@ -258,7 +257,16 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
         self.__clearWatches()
 
     def watchmanCommand(self, *args):
-        return self.getClient().query(*args)
+        client = self.getClient()
+        return client.query(*args)
+
+    def watchmanInstance(self):
+        return WatchmanInstance.getSharedInstance(self.watchmanConfig())
+
+    def watchmanConfig(self):
+        """Watchman config for this test case"""
+        config = {"enable_parallel_crawl": self.parallelCrawl}
+        return config
 
     def _waitForCheck(self, cond, res_check, timeout: float):
         deadline = time.time() + timeout
@@ -416,6 +424,21 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
 
         return None
 
+    def waitForSubFileList(self, name, root, fileList: List[str], timeout=None):
+        def accept(subResults: List[Dict[str, Any]]) -> bool:
+            if subResults is None:
+                return False
+
+            normalizedResult = self.normalizeFiles(subResults[-1])
+
+            for file in fileList:
+                if file not in normalizedResult["files"]:
+                    return False
+
+            return True
+
+        return self.waitForSub(name, root, accept=accept, timeout=timeout)
+
     def getSubscription(self, name, root, remove: bool = True, normalize: bool = True):
         data = self.getClient().getSubscription(name, root=root, remove=remove)
 
@@ -448,10 +471,10 @@ class WatchmanTestCase(TempDirPerTestMixin, unittest.TestCase):
         return self._case_insensitive
 
     def suspendWatchman(self) -> None:
-        WatchmanInstance.getSharedInstance().suspend()
+        self.watchmanInstance().suspend()
 
     def resumeWatchman(self) -> None:
-        WatchmanInstance.getSharedInstance().resume()
+        self.watchmanInstance().resume()
 
     def rootIsWatched(self, r) -> bool:
         r = norm_absolute_path(r)
@@ -495,13 +518,13 @@ def expand_matrix(test_class) -> None:
     """
 
     matrix = [
-        ("unix", "bser", "UnixBser2"),
-        ("unix", "json", "UnixJson"),
-        ("cli", "json", "CliJson"),
+        ("unix", "bser", "parallel", "UnixBser2"),
+        ("unix", "json", "serial", "UnixJson"),
+        ("cli", "json", "parallel", "CliJson"),
     ]
 
     if os.name == "nt":
-        matrix += [("namedpipe", "bser", "NamedPipeBser2")]
+        matrix += [("namedpipe", "bser", "serial", "NamedPipeBser2")]
 
     # We do some rather hacky things here to define new test class types
     # in our caller's scope.  This is needed so that the unittest TestLoader
@@ -509,31 +532,30 @@ def expand_matrix(test_class) -> None:
     # pyre-fixme[16]: Optional type has no attribute `f_back`.
     caller_scope = inspect.currentframe().f_back.f_locals
 
-    for (transport, encoding, suffix) in matrix:
+    def make_class(transport, encoding, suffix, parallel):
+        subclass_name = test_class.__name__ + suffix
 
-        def make_class(transport, encoding, suffix):
-            subclass_name = test_class.__name__ + suffix
+        # Define a new class that derives from the input class
+        class MatrixTest(test_class):
+            def setDefaultConfiguration(self):
+                self.setConfiguration(transport, encoding, parallel)
 
-            # Define a new class that derives from the input class
-            class MatrixTest(test_class):
-                def setDefaultConfiguration(self):
-                    self.setConfiguration(transport, encoding)
+        # Set the name and module information on our new subclass
+        MatrixTest.__name__ = subclass_name
+        MatrixTest.__qualname__ = subclass_name
+        MatrixTest.__module__ = test_class.__module__
 
-            # Set the name and module information on our new subclass
-            MatrixTest.__name__ = subclass_name
-            MatrixTest.__qualname__ = subclass_name
-            MatrixTest.__module__ = test_class.__module__
+        # Before we publish the test, check whether that generated
+        # configuration would always skip
+        try:
+            t = MatrixTest()
+            t.checkPersistentSession()
+            t.checkOSApplicability()
+            caller_scope[subclass_name] = MatrixTest
+        except unittest.SkipTest:
+            pass
 
-            # Before we publish the test, check whether that generated
-            # configuration would always skip
-            try:
-                t = MatrixTest()
-                t.checkPersistentSession()
-                t.checkOSApplicability()
-                caller_scope[subclass_name] = MatrixTest
-            except unittest.SkipTest:
-                pass
-
-        make_class(transport, encoding, suffix)
+    for (transport, encoding, parallel, suffix) in matrix:
+        make_class(transport, encoding, suffix, parallel == "parallel")
 
     return None

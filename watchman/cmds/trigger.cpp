@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "watchman/Client.h"
 #include "watchman/CommandRegistry.h"
 #include "watchman/Logging.h"
 #include "watchman/TriggerCommand.h"
@@ -23,8 +24,8 @@ using namespace watchman;
 /* trigger-del /root triggername
  * Delete a trigger from a root
  */
-static void cmd_trigger_delete(
-    struct watchman_client* client,
+static UntypedResponse cmd_trigger_delete(
+    Client* client,
     const json_ref& args) {
   w_string tname;
   bool res;
@@ -32,13 +33,11 @@ static void cmd_trigger_delete(
   auto root = resolveRoot(client, args);
 
   if (json_array_size(args) != 3) {
-    send_error_response(client, "wrong number of arguments");
-    return;
+    throw ErrorResponse("wrong number of arguments");
   }
   auto jname = args.at(2);
   if (!jname.isString()) {
-    send_error_response(client, "expected 2nd parameter to be trigger name");
-    return;
+    throw ErrorResponse("expected 2nd parameter to be trigger name");
   }
   tname = json_to_w_string(jname);
 
@@ -65,31 +64,28 @@ static void cmd_trigger_delete(
     w_state_save();
   }
 
-  auto resp = make_response();
+  UntypedResponse resp;
   resp.set({{"deleted", json_boolean(res)}, {"trigger", json_ref(jname)}});
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
-W_CMD_REG("trigger-del", cmd_trigger_delete, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("trigger-del", cmd_trigger_delete, CMD_DAEMON, w_cmd_realpath_root);
 
 /* trigger-list /root
  * Displays a list of registered triggers for a given root
  */
-static void cmd_trigger_list(
-    struct watchman_client* client,
-    const json_ref& args) {
+static UntypedResponse cmd_trigger_list(Client* client, const json_ref& args) {
   auto root = resolveRoot(client, args);
 
-  auto resp = make_response();
+  UntypedResponse resp;
   auto arr = root->triggerListToJson();
 
   resp.set("triggers", std::move(arr));
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
-W_CMD_REG("trigger-list", cmd_trigger_list, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("trigger-list", cmd_trigger_list, CMD_DAEMON, w_cmd_realpath_root);
 
 static json_ref build_legacy_trigger(
     const std::shared_ptr<Root>& root,
-    struct watchman_client* client,
     const json_ref& args) {
   uint32_t next_arg = 0;
   uint32_t i;
@@ -106,28 +102,30 @@ static json_ref build_legacy_trigger(
              typed_string_to_json("size"),
              typed_string_to_json("mode")})}});
 
-  json_ref expr;
+  json_ref expr = json_null();
   auto query = parseQueryLegacy(root, args, 3, &next_arg, nullptr, &expr);
   query->request_id = w_string::build("trigger ", json_to_w_string(args.at(2)));
 
-  json_object_set(trig, "expression", expr.get_default("expression"));
+  json_object_set(
+      trig,
+      "expression",
+      expr.get_optional("expression").value_or(json_null()));
 
   if (next_arg >= args.array().size()) {
-    send_error_response(client, "no command was specified");
-    return nullptr;
+    throw ErrorResponse("no command was specified");
   }
 
   n = json_array_size(args) - next_arg;
-  auto command = json_array_of_size(n);
+  std::vector<json_ref> command;
+  command.reserve(n);
   for (i = 0; i < n; i++) {
     auto ele = args.at(i + next_arg);
     if (!ele.isString()) {
-      send_error_response(client, "expected argument %d to be a string", i);
-      return nullptr;
+      throw ErrorResponse("expected argument {} to be a string", i);
     }
-    json_array_append(command, ele);
+    command.push_back(std::move(ele));
   }
-  json_object_set_new(trig, "command", std::move(command));
+  json_object_set_new(trig, "command", json_array(std::move(command)));
 
   return trig;
 }
@@ -135,30 +133,24 @@ static json_ref build_legacy_trigger(
 /* trigger /root triggername [watch patterns] -- cmd to run
  * Sets up a trigger so that we can execute a command when a change
  * is detected */
-static void cmd_trigger(struct watchman_client* client, const json_ref& args) {
+static UntypedResponse cmd_trigger(Client* client, const json_ref& args) {
   bool need_save = true;
   std::unique_ptr<TriggerCommand> cmd;
-  json_ref trig;
-  json_ref resp;
 
   auto root = resolveRoot(client, args);
 
   if (json_array_size(args) < 3) {
-    send_error_response(client, "not enough arguments");
-    return;
+    throw ErrorResponse("not enough arguments");
   }
 
-  trig = args.at(2);
+  json_ref trig = args.at(2);
   if (trig.isString()) {
-    trig = build_legacy_trigger(root, client, args);
-    if (!trig) {
-      return;
-    }
+    trig = build_legacy_trigger(root, args);
   }
 
   cmd = std::make_unique<TriggerCommand>(getInterface, root, trig);
 
-  resp = make_response();
+  UntypedResponse resp;
   resp.set("triggerid", w_string_to_json(cmd->triggername));
 
   {
@@ -195,9 +187,9 @@ static void cmd_trigger(struct watchman_client* client, const json_ref& args) {
     w_state_save();
   }
 
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
-W_CMD_REG("trigger", cmd_trigger, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("trigger", cmd_trigger, CMD_DAEMON, w_cmd_realpath_root);
 
 /* vim:ts=2:sw=2:et:
  */

@@ -26,7 +26,6 @@
 #include "watchman/watchman_string.h"
 #include "watchman/watchman_system.h"
 
-struct watchman_client;
 struct watchman_file;
 
 namespace watchman {
@@ -159,7 +158,7 @@ class InMemoryView final : public QueryableView {
   InMemoryView& operator=(InMemoryView&&) = delete;
 
   ClockPosition getMostRecentRootNumberAndTickValue() const override;
-  uint32_t getLastAgeOutTickValue() const override;
+  ClockTicks getLastAgeOutTickValue() const override;
   std::chrono::system_clock::time_point getLastAgeOutTimeStamp() const override;
   w_string getCurrentClockString() const override;
 
@@ -177,6 +176,15 @@ class InMemoryView final : public QueryableView {
   CookieSync::SyncResult syncToNow(
       const std::shared_ptr<Root>& root,
       std::chrono::milliseconds timeout) override;
+
+  /**
+   * Write cookies to the working copy and wait to see them.
+   *
+   * The returned future will complete when all the cookies written to the
+   * working copy have been noticed by the underlying watcher.
+   */
+  folly::SemiFuture<CookieSync::SyncResult> sync(
+      const std::shared_ptr<Root>& root) override;
 
   bool doAnyOfTheseFilesExist(
       const std::vector<w_string>& fileNames) const override;
@@ -213,8 +221,6 @@ class InMemoryView final : public QueryableView {
 
   // If content cache warming is configured, do the warm up now
   void warmContentCache();
-
-  SCM* getSCM() const override;
 
   InMemoryViewCaches& debugAccessCaches() const {
     return caches_;
@@ -272,7 +278,7 @@ class InMemoryView final : public QueryableView {
       ViewDatabase& view,
       PendingChanges& coll,
       const PendingChange& pending,
-      const DirEntry* pre_stat,
+      const FileInformation* pre_stat,
       std::vector<w_string>& pendingCookies);
 
   /**
@@ -293,6 +299,18 @@ class InMemoryView final : public QueryableView {
       std::vector<w_string>& pendingCookies);
 
   /**
+   * Crawl the given directory recursively using ParallelWalker.
+   *
+   * W_PENDING_RECURSIVE must be set.
+   */
+  void crawlerParallel(
+      const std::shared_ptr<Root>& root,
+      ViewDatabase& view,
+      PendingChanges& coll,
+      const PendingChange& pending,
+      std::vector<w_string>& pendingCookies);
+
+  /**
    * Called on the IO thread. If `pending` is not in the ignored directory list,
    * lstat() the file and update the InMemoryView. This may insert work into
    * `coll` if a directory needs to be rescanned.
@@ -303,7 +321,7 @@ class InMemoryView final : public QueryableView {
       ViewDatabase& view,
       PendingChanges& coll,
       const PendingChange& pending,
-      const DirEntry* pre_stat);
+      const FileInformation* pre_stat);
 
   // END IOTHREAD
 
@@ -362,11 +380,11 @@ class InMemoryView final : public QueryableView {
   folly::Synchronized<ViewDatabase> view_;
   // The most recently observed tick value of an item in the view
   // Only incremented by the iothread, but may be read by other threads.
-  std::atomic<uint32_t> mostRecentTick_{1};
-  const uint32_t rootNumber_{0};
+  std::atomic<ClockTicks> mostRecentTick_{1};
+  const ClockRoot rootNumber_{0};
   const w_string rootPath_;
 
-  uint32_t lastAgeOutTick_{0};
+  ClockTicks lastAgeOutTick_{0};
   // This is system_clock instead of steady_clock because it's compared with a
   // file's otime.
   std::chrono::system_clock::time_point lastAgeOutTimestamp_{};
@@ -407,9 +425,6 @@ class InMemoryView final : public QueryableView {
   // Remember what we've already warmed up
   uint32_t lastWarmedTick_{0};
 
-  // The source control system that we detected during initialization
-  std::unique_ptr<SCM> scm_;
-
   struct PendingChangeLogEntry {
     PendingChangeLogEntry() noexcept {
       // time_point is not noexcept so this can't be defaulted.
@@ -440,6 +455,9 @@ class InMemoryView final : public QueryableView {
 
   // If set, paths processed by processPending are logged here.
   std::unique_ptr<RingBuffer<PendingChangeLogEntry>> processedPaths_;
+
+  // Track statPath() count during fullCrawl(). Used to report progress.
+  std::shared_ptr<std::atomic<size_t>> fullCrawlStatCount_;
 };
 
 } // namespace watchman

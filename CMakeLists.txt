@@ -263,8 +263,8 @@ if(have_fcntl.h)
     config_h("#define HAVE_DECL_O_SYMLINK 1")
   endif()
 endif()
-find_package(PCRE)
-if(PCRE_FOUND)
+find_package(PCRE2)
+if(PCRE2_FOUND)
   config_h("#define HAVE_PCRE_H 1")
 endif()
 
@@ -281,11 +281,6 @@ else()
   file(RENAME "${CMAKE_CURRENT_BINARY_DIR}/config.h.new"
     "${CMAKE_CURRENT_BINARY_DIR}/config.h")
 endif()
-
-configure_file(
-  watchman/thirdparty/jansson/jansson_config.h.in
-  watchman/thirdparty/jansson/jansson_config.h)
-include_directories(${CMAKE_CURRENT_BINARY_DIR}/watchman/thirdparty/jansson)
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -325,6 +320,7 @@ find_package(Gflags REQUIRED)
 include_directories(SYSTEM ${GFLAGS_INCLUDE_DIR})
 
 find_package(Glog REQUIRED)
+add_compile_definitions(GLOG_NO_ABBREVIATED_SEVERITIES)
 
 # We indirectly depend on boost.  This logic needs to match
 # the same criteria used in thrift, which wants static libs
@@ -346,9 +342,9 @@ find_package(
 find_package(LibEvent REQUIRED)
 get_filename_component(LIBEVENT_LIBDIR "${LIBEVENT_LIB}" DIRECTORY)
 link_directories(${LIBEVENT_LIBDIR})
+find_package(edencommon CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(folly CONFIG REQUIRED)
-
 
 if (ENABLE_EDEN_SUPPORT)
   find_package(fizz CONFIG REQUIRED)
@@ -454,6 +450,7 @@ target_link_libraries(third_party_deps INTERFACE
   gflags
   ${Boost_LIBRARIES}
   fmt::fmt
+  edencommon::utils
 )
 target_include_directories(third_party_deps INTERFACE
   ${FOLLY_INCLUDE_DIR}
@@ -470,14 +467,15 @@ if (ENABLE_EDEN_SUPPORT)
     cpptoml
   )
 endif()
-if(PCRE_FOUND)
-  target_link_libraries(third_party_deps INTERFACE ${PCRE_LIBRARY})
-  target_include_directories(third_party_deps INTERFACE ${PCRE_INCLUDE_DIR})
+if(PCRE2_FOUND)
+  target_link_libraries(third_party_deps INTERFACE ${PCRE2_LIBRARY})
+  target_include_directories(third_party_deps INTERFACE ${PCRE2_INCLUDE_DIR})
+  target_compile_definitions(third_party_deps INTERFACE ${PCRE2_DEFINES})
   if (WIN32)
     # The pcre headers assume that the library is a dll by default
     # but our preferred build environment only builds them as
     # static, so be sure to ask for static pcre linkage
-    target_compile_definitions(third_party_deps INTERFACE PCRE_STATIC)
+    target_compile_definitions(third_party_deps INTERFACE PCRE2_STATIC)
   endif()
 endif()
 target_link_libraries(third_party_deps INTERFACE Threads::Threads)
@@ -498,7 +496,12 @@ add_library(wildmatch STATIC
   watchman/thirdparty/wildmatch/wildmatch.c
   watchman/thirdparty/wildmatch/wildmatch.h
 )
-add_library(log STATIC watchman/PubSub.cpp watchman/LogConfig.cpp watchman/Logging.cpp)
+add_library(log STATIC
+  watchman/PubSub.cpp
+  watchman/LogConfig.cpp
+  watchman/Logging.cpp
+  watchman/portability/Backtrace.cpp
+)
 target_link_libraries(log third_party_deps)
 add_library(hash STATIC watchman/hash.cpp)
 target_link_libraries(hash third_party_deps)
@@ -527,6 +530,7 @@ watchman/FlagMap.cpp
 watchman/IgnoreSet.cpp
 watchman/PendingCollection.cpp
 watchman/fs/Pipe.cpp
+watchman/fs/WindowsTime.cpp
 watchman/ThreadPool.cpp
 watchman/WatchmanConfig.cpp
 watchman/bser.cpp
@@ -534,20 +538,12 @@ watchman/fs/UnixDirHandle.cpp
 watchman/fs/WinDirHandle.cpp
 watchman/stream.cpp
 watchman/stream_unix.cpp
+watchman/stream_win.cpp
+watchman/portability/PosixSpawn.cpp
+watchman/portability/WinError.cpp
 watchman/root/dir.cpp
 watchman/root/file.cpp
 )
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  list(APPEND testsupport_sources
-watchman/winbuild/time.cpp
-watchman/winbuild/backtrace.cpp
-watchman/winbuild/errmap.cpp
-watchman/winbuild/pathmap.cpp
-watchman/winbuild/posix_spawn.cpp
-watchman/stream_win.cpp
-  )
-endif()
 
 add_library(testsupport STATIC ${testsupport_sources})
 target_link_libraries(testsupport log string jansson third_party_deps)
@@ -579,8 +575,11 @@ endif()
 
 list(APPEND watchman_sources
 watchman/ChildProcess.cpp
+watchman/Client.cpp
 watchman/Clock.cpp
+watchman/Command.cpp
 watchman/CommandRegistry.cpp
+watchman/Connect.cpp
 watchman/ContentHash.cpp
 watchman/CookieSync.cpp
 watchman/Errors.cpp
@@ -596,6 +595,7 @@ watchman/Options.cpp
 watchman/PDU.cpp
 watchman/PendingCollection.cpp
 watchman/PerfSample.cpp
+watchman/fs/ParallelWalk.cpp
 watchman/fs/Pipe.cpp
 watchman/ProcessLock.cpp
 # PubSub.cpp  (in liblog)
@@ -607,11 +607,11 @@ watchman/SymlinkTargets.cpp
 watchman/ThreadPool.cpp
 watchman/TriggerCommand.cpp
 watchman/fs/UnixDirHandle.cpp
+watchman/fs/WindowsTime.cpp
 watchman/UserDir.cpp
 watchman/WatchmanConfig.cpp
 watchman/fs/WinDirHandle.cpp
 watchman/bser.cpp
-watchman/clientmode.cpp
 # hash.cpp (in libhash)
 watchman/launchd.cpp
 watchman/listener-user.cpp
@@ -622,7 +622,10 @@ watchman/state.cpp
 watchman/stream.cpp
 watchman/stream_unix.cpp
 watchman/stream_stdout.cpp
+watchman/stream_win.cpp
 # string.cpp (in libstring)
+watchman/portability/PosixSpawn.cpp
+watchman/portability/WinError.cpp
 watchman/query/FileResult.cpp
 watchman/query/LocalFileResult.cpp
 watchman/query/GlobTree.cpp
@@ -650,7 +653,6 @@ watchman/cmds/find.cpp
 watchman/cmds/info.cpp
 watchman/cmds/log.cpp
 watchman/cmds/query.cpp
-watchman/cmds/reg.cpp
 watchman/cmds/since.cpp
 watchman/cmds/state.cpp
 watchman/cmds/subscribe.cpp
@@ -675,6 +677,7 @@ watchman/saved_state/SavedStateInterface.cpp
 watchman/scm/Git.cpp
 watchman/scm/Mercurial.cpp
 watchman/scm/SCM.cpp
+watchman/thirdparty/getopt/GetOpt.cpp
 watchman/watcher/Watcher.cpp
 watchman/watcher/WatcherRegistry.cpp
 watchman/watcher/fsevents.cpp
@@ -682,25 +685,12 @@ watchman/watcher/inotify.cpp
 watchman/watcher/kqueue.cpp
 watchman/watcher/portfs.cpp
 watchman/watcher/kqueue_and_fsevents.cpp
+watchman/watcher/win32.cpp
 )
 
 if (ENABLE_EDEN_SUPPORT)
   # We currently only support talking to eden on posix systems
   list(APPEND watchman_sources watchman/watcher/eden.cpp)
-endif()
-
-if (WIN32)
-  list(APPEND watchman_sources
-watchman/stream_win.cpp
-watchman/watcher/win32.cpp
-watchman/winbuild/errmap.cpp
-watchman/winbuild/pathmap.cpp
-watchman/winbuild/mkdir.cpp
-watchman/winbuild/time.cpp
-watchman/winbuild/backtrace.cpp
-watchman/winbuild/getopt_long.cpp
-watchman/winbuild/posix_spawn.cpp
-  )
 endif()
 
 add_executable(watchman ${watchman_sources})
@@ -773,14 +763,20 @@ if(Python3_Interpreter_FOUND)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
-t_test(art watchman/test/art_test.cpp)
-t_test(ignore watchman/test/ignore_test.cpp)
-t_test(PendingCollectionTest watchman/test/PendingCollectionTest.cpp)
-t_test(string watchman/test/string_test.cpp)
-t_test(log watchman/test/log.cpp)
-t_test(bser watchman/test/bser.cpp)
-t_test(wildmatch watchman/test/wildmatch_test.cpp)
-t_test(childproc watchman/test/childproc.cpp)
-t_test(result watchman/test/ResultTest.cpp)
+t_test(art watchman/test/ArtTest.cpp)
+t_test(bser watchman/test/BserTest.cpp)
 t_test(cache watchman/test/CacheTest.cpp)
-t_test(MapUtilTest watchman/test/MapUtilTest.cpp)
+t_test(childproc watchman/test/ChildProcTest.cpp)
+t_test(fsdetect watchman/test/FSDetectTest.cpp)
+t_test(ignore watchman/test/BserTest.cpp)
+# Linking this test needs the targets graph to be cleaned up.
+#t_test(inmemoryview watchman/test/InMemoryViewTest.cpp)
+t_test(log watchman/test/LogTest.cpp)
+t_test(maputil watchman/test/MapUtilTest.cpp)
+t_test(pendingcollection watchman/test/PendingCollectionTest.cpp)
+# Linking this test needs the targets graph to be cleaned up.
+#t_test(perfsample watchman/test/PerfSampleTest.cpp)
+t_test(result watchman/test/ResultTest.cpp)
+t_test(ringbuffer watchman/test/RingBufferTest.cpp)
+t_test(string watchman/test/StringTest.cpp)
+t_test(wildmatch watchman/test/WildmatchTest.cpp)

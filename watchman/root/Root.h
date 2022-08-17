@@ -9,10 +9,12 @@
 
 #include <memory>
 #include <unordered_map>
+#include "watchman/Clock.h"
 #include "watchman/CookieSync.h"
 #include "watchman/IgnoreSet.h"
 #include "watchman/PendingCollection.h"
 #include "watchman/PubSub.h"
+#include "watchman/Serde.h"
 #include "watchman/WatchmanConfig.h"
 #include "watchman/fs/FileSystem.h"
 #include "watchman/thirdparty/jansson/jansson.h"
@@ -47,7 +49,7 @@ class ClientStateAssertion {
   // Deferred payload to send when this assertion makes it to the front
   // of the queue.
   // locking: You must hold root->assertedStates lock to access this member.
-  json_ref enterPayload;
+  std::optional<json_ref> enterPayload;
 
   ClientStateAssertion(const std::shared_ptr<Root>& root, const w_string& name)
       : root(root), name(name) {}
@@ -108,6 +110,90 @@ IgnoreSet computeIgnoreSet(
     const w_string& root_path,
     const Configuration& config);
 
+struct RootRecrawlInfo : serde::Object {
+  int64_t count;
+  bool should_recrawl;
+  std::optional<w_string> warning;
+  w_string reason;
+  std::optional<int64_t> started_at;
+  std::optional<int64_t> completed_at;
+  std::optional<int64_t> stat_count;
+
+  template <typename X>
+  void map(X& x) {
+    x("count", count);
+    x("should-recrawl", should_recrawl);
+    x("warning", warning);
+    x("reason", reason);
+    x("started", started_at);
+    x("completed", completed_at);
+    x("stats", stat_count);
+  }
+};
+
+struct RootQueryInfo : serde::Object {
+  int64_t elapsed_milliseconds;
+  int64_t cookie_sync_duration_milliseconds;
+  int64_t generation_duration_milliseconds;
+  int64_t render_duration_milliseconds;
+  int64_t view_lock_wait_duration_milliseconds;
+  w_string state;
+  int64_t client_pid;
+  std::optional<w_string> request_id;
+  std::optional<json_ref> query;
+  std::optional<w_string> subscription_name;
+
+  template <typename X>
+  void map(X& x) {
+    x("elapsed-milliseconds", elapsed_milliseconds);
+    x("cookie-sync-duration-milliseconds", cookie_sync_duration_milliseconds);
+    x("generation-duration-milliseconds", generation_duration_milliseconds);
+    x("render-duration-milliseconds", render_duration_milliseconds);
+    x("view-lock-wait-duration-milliseconds",
+      view_lock_wait_duration_milliseconds);
+    x("state", state);
+    x("client-pid", client_pid);
+    x("request-id", request_id);
+    x.skip_if(
+        "query", query, [](const auto& query) { return !query.has_value(); });
+  }
+};
+
+struct RootDebugStatus : serde::Object {
+  w_string path;
+  w_string fstype;
+  w_string watcher;
+  int64_t uptime;
+  bool case_sensitive;
+  std::vector<w_string> cookie_prefix;
+  std::vector<w_string> cookie_dir;
+  std::vector<w_string> cookie_list;
+  RootRecrawlInfo recrawl_info;
+  std::vector<RootQueryInfo> queries;
+  bool done_initial;
+  bool cancelled;
+  bool enable_parallel_crawl;
+  w_string crawl_status;
+
+  template <typename X>
+  void map(X& x) {
+    x("path", path);
+    x("fstype", fstype);
+    x("watcher", watcher);
+    x("uptime", uptime);
+    x("case_sensitive", case_sensitive);
+    x("cookie_prefix", cookie_prefix);
+    x("cookie_dir", cookie_dir);
+    x("cookie_list", cookie_list);
+    x("recrawl_info", recrawl_info);
+    x("queries", queries);
+    x("done_initial", done_initial);
+    x("cancelled", cancelled);
+    x("crawl-status", crawl_status);
+    x("enable_parallel_crawl", enable_parallel_crawl);
+  }
+};
+
 /**
  * Represents a watched root directory.
  *
@@ -127,10 +213,16 @@ class Root : public RootConfig, public std::enable_shared_from_this<Root> {
       std::unordered_map<w_string, std::unique_ptr<TriggerCommand>>>
       triggers;
 
+  const std::chrono::steady_clock::time_point startTime =
+      std::chrono::steady_clock::now();
+
   CookieSync cookies;
 
+  /* mutable config items */
+  std::atomic<bool> enable_parallel_crawl;
+
   /* config options loaded via json file */
-  json_ref config_file;
+  std::optional<json_ref> config_file;
   Configuration config;
 
   const std::chrono::milliseconds trigger_settle{0};
@@ -155,10 +247,14 @@ class Root : public RootConfig, public std::enable_shared_from_this<Root> {
     /* if true, we've decided that we should re-crawl the root
      * for the sake of ensuring consistency */
     bool shouldRecrawl = true;
+    // Last recrawl reason
+    w_string reason{"startup"};
     // Last ad-hoc warning message
     w_string warning;
     std::chrono::steady_clock::time_point crawlStart;
     std::chrono::steady_clock::time_point crawlFinish;
+    // Number of statPath() called during recrawl
+    std::shared_ptr<std::atomic<size_t>> statCount;
   };
   folly::Synchronized<RecrawlInfo> recrawlInfo;
 
@@ -186,7 +282,7 @@ class Root : public RootConfig, public std::enable_shared_from_this<Root> {
     std::atomic<bool> cancelled{false};
 
     /* map of cursor name => last observed tick value */
-    folly::Synchronized<std::unordered_map<w_string, uint32_t>> cursors;
+    folly::Synchronized<std::unordered_map<w_string, ClockTicks>> cursors;
 
     /// Set by connection threads and read on the iothread.
     std::atomic<std::chrono::steady_clock::time_point> last_cmd_timestamp{
@@ -214,7 +310,7 @@ class Root : public RootConfig, public std::enable_shared_from_this<Root> {
       FileSystem& fileSystem,
       const w_string& root_path,
       const w_string& fs_type,
-      json_ref config_file,
+      std::optional<json_ref> config_file,
       Configuration config,
       std::shared_ptr<QueryableView> view,
       SaveGlobalStateHook saveGlobalStateHook);
@@ -240,8 +336,8 @@ class Root : public RootConfig, public std::enable_shared_from_this<Root> {
   bool stopWatch();
   json_ref triggerListToJson() const;
 
-  static json_ref getStatusForAllRoots();
-  json_ref getStatus() const;
+  static std::vector<RootDebugStatus> getStatusForAllRoots();
+  RootDebugStatus getStatus() const;
 
   // Annotate the sample with some standard metadata taken from a root.
   void addPerfSampleMetadata(PerfSample& sample) const;

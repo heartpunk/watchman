@@ -57,15 +57,12 @@ MercurialResult runMercurial(
     auto error = std::string{outputs.second.view()};
     replaceEmbeddedNulls(output);
     replaceEmbeddedNulls(error);
-    throw SCMError{
-        "failed to ",
+    SCMError::throwf(
+        "failed to {}\ncmd = {}\nstdout = {}\nstderr = {}",
         description,
-        "\ncmd = ",
         folly::join(" ", cmdline),
-        "\nstdout = ",
         output,
-        "\nstderr = ",
-        error};
+        error);
   }
 
   return MercurialResult{std::move(outputs.first)};
@@ -214,13 +211,14 @@ w_string Mercurial::mergeBaseWith(w_string_piece commitId, w_string requestId)
                 "query for the merge base");
 
             if (!result.output) {
-              throw SCMError(
-                  "no output was returned from `hg log -T{node} -r ", revset);
+              SCMError::throwf(
+                  "no output was returned from `hg log -T{{node}} -r {}",
+                  revset);
             }
 
             if (result.output.size() != 40) {
-              throw SCMError(
-                  "expected merge base to be a 40 character string, got ",
+              SCMError::throwf(
+                  "expected merge base to be a 40 character string, got {}",
                   result.output.view());
             }
 
@@ -232,10 +230,9 @@ w_string Mercurial::mergeBaseWith(w_string_piece commitId, w_string requestId)
 
 std::vector<w_string> Mercurial::getFilesChangedSinceMergeBaseWith(
     w_string_piece commitId,
+    w_string_piece clock,
     w_string requestId) const {
-  auto mtime = getDirStateMtime();
-  auto key = folly::to<std::string>(
-      commitId.view(), ":", mtime.tv_sec, ":", mtime.tv_nsec);
+  auto key = folly::to<std::string>(commitId.view(), ":", clock.view());
   auto commitCopy = std::string{commitId.view()};
 
   // This is not going to include changes to directories across commits because

@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include "watchman/Errors.h"
 #include "watchman/watchman_string.h"
 #include "watchman/watchman_system.h"
 
@@ -25,12 +26,10 @@ w_string findFileInDirTree(
     w_string_piece rootPath,
     std::initializer_list<w_string_piece> candidates);
 
-class SCMError : public std::runtime_error {
+class SCMError : public WatchmanError<SCMError> {
  public:
-  template <typename... Args>
-  explicit SCMError(Args&&... args)
-      : std::runtime_error(
-            folly::to<std::string>(std::forward<Args>(args)...)) {}
+  static constexpr char* prefix = nullptr;
+  using WatchmanError::WatchmanError;
 };
 
 class SCM {
@@ -71,6 +70,7 @@ class SCM {
   // but NOT those that are ignored.
   virtual std::vector<w_string> getFilesChangedSinceMergeBaseWith(
       w_string_piece commitId,
+      w_string_piece clock,
       w_string requestId = nullptr) const = 0;
 
   struct StatusResult {

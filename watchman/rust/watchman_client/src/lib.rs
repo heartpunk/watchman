@@ -39,24 +39,38 @@ pub mod expr;
 pub mod fields;
 mod named_pipe;
 pub mod pdu;
-use bytes::{Bytes, BytesMut};
-use futures::{future::FutureExt, stream::StreamExt};
-use serde_bser::de::{Bunser, SliceRead};
-use serde_bser::value::Value;
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io;
+use std::io::Write;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+use bytes::Bytes;
+use bytes::BytesMut;
+use futures::future::FutureExt;
+use futures::stream::StreamExt;
+use serde_bser::de::Bunser;
+use serde_bser::de::SliceRead;
+use serde_bser::value::Value;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::Command;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
-use tokio_util::codec::{Decoder, FramedRead};
+use tokio_util::codec::Decoder;
+use tokio_util::codec::FramedRead;
 
 /// The next id number to use when generating a subscription name
 static SUB_ID: AtomicUsize = AtomicUsize::new(1);
@@ -68,7 +82,10 @@ pub mod prelude {
     pub use crate::fields::*;
     pub use crate::pdu::*;
     pub use crate::query_result_type;
-    pub use crate::{CanonicalPath, Client, Connector, ResolvedRoot};
+    pub use crate::CanonicalPath;
+    pub use crate::Client;
+    pub use crate::Connector;
+    pub use crate::ResolvedRoot;
 }
 
 use prelude::*;
@@ -206,8 +223,13 @@ impl Connector {
                 .map(|p| p.as_ref())
                 .unwrap_or_else(|| Path::new("watchman"));
 
-            let output = Command::new(watchman_path)
-                .args(&["--output-encoding", "bser-v2", "get-sockname"])
+            let mut cmd = Command::new(watchman_path);
+            cmd.args(&["--output-encoding", "bser-v2", "get-sockname"]);
+
+            #[cfg(windows)]
+            cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+
+            let output = cmd
                 .output()
                 .await
                 .map_err(|source| Error::ConnectionDiscovery {
@@ -1126,12 +1148,15 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use futures::stream::{self, TryStreamExt};
-    use serde::{Deserialize, Serialize};
     use std::io;
+
+    use futures::stream;
+    use futures::stream::TryStreamExt;
+    use serde::Deserialize;
+    use serde::Serialize;
     use tokio_util::io::StreamReader;
+
+    use super::*;
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct TestStruct {

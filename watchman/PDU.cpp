@@ -8,38 +8,32 @@
 #include "watchman/PDU.h"
 #include <folly/Range.h>
 #include <folly/String.h>
-#include "watchman/CommandRegistry.h"
 #include "watchman/Constants.h"
 #include "watchman/Logging.h"
 #include "watchman/bser.h"
+#include "watchman/portability/WinError.h"
 #include "watchman/watchman_stream.h"
 
-using namespace watchman;
+namespace watchman {
 
-W_CAP_REG("bser-v2")
-watchman_json_buffer::watchman_json_buffer()
-    : buf((char*)malloc(WATCHMAN_IO_BUF_SIZE)),
-      allocd(WATCHMAN_IO_BUF_SIZE),
-      rpos(0),
-      wpos(0),
-      pdu_type(need_data),
-      capabilities(0) {
+PduBuffer::PduBuffer()
+    : buf((char*)malloc(WATCHMAN_IO_BUF_SIZE)), allocd(WATCHMAN_IO_BUF_SIZE) {
   if (!buf) {
     throw std::bad_alloc();
   }
 }
 
-void watchman_json_buffer::clear() {
+PduBuffer::~PduBuffer() {
+  free(buf);
+}
+
+void PduBuffer::clear() {
   wpos = 0;
   rpos = 0;
 }
 
-watchman_json_buffer::~watchman_json_buffer() {
-  free(buf);
-}
-
 // Shunt down, return available size
-uint32_t watchman_json_buffer::shuntDown() {
+uint32_t PduBuffer::shuntDown() {
   if (rpos && rpos == wpos) {
     rpos = 0;
     wpos = 0;
@@ -52,16 +46,12 @@ uint32_t watchman_json_buffer::shuntDown() {
   return allocd - wpos;
 }
 
-bool watchman_json_buffer::fillBuffer(w_stm_t stm) {
-  uint32_t avail;
-  int r;
-
-  avail = shuntDown();
+bool PduBuffer::fillBuffer(watchman_stream* stm) {
+  uint32_t avail = shuntDown();
 
   // Get some more space if we need it
   if (avail == 0) {
     char* newBuf = (char*)realloc(buf, allocd * 2);
-
     if (!newBuf) {
       return false;
     }
@@ -73,7 +63,7 @@ bool watchman_json_buffer::fillBuffer(w_stm_t stm) {
   }
 
   errno = 0;
-  r = stm->read(buf + wpos, avail);
+  int r = stm->read(buf + wpos, avail);
   if (r <= 0) {
     return false;
   }
@@ -83,7 +73,7 @@ bool watchman_json_buffer::fillBuffer(w_stm_t stm) {
   return true;
 }
 
-inline enum w_pdu_type watchman_json_buffer::detectPdu() {
+inline PduType PduBuffer::detectPdu() {
   if (wpos - rpos < 2) {
     return need_data;
   }
@@ -96,22 +86,18 @@ inline enum w_pdu_type watchman_json_buffer::detectPdu() {
   return is_json_compact;
 }
 
-json_ref watchman_json_buffer::readJsonPrettyPdu(
-    w_stm_t stm,
+std::optional<json_ref> PduBuffer::readJsonPrettyPdu(
+    watchman_stream* stm,
     json_error_t* jerr) {
-  char* nl;
-  int r;
-  json_ref res;
-
   // Assume newline is at the end of what we have
-  nl = buf + wpos;
-  r = (int)(nl - (buf + rpos));
-  res = json_loadb(buf + rpos, r, 0, jerr);
+  char* nl = buf + wpos;
+  int r = (int)(nl - (buf + rpos));
+  std::optional<json_ref> res = json_loadb(buf + rpos, r, 0, jerr);
   while (!res) {
     // Maybe we can fill more data into the buffer and retry?
     if (!fillBuffer(stm)) {
       // No, then error is terminal
-      return nullptr;
+      return std::nullopt;
     }
     // Recompute end of buffer
     nl = buf + wpos;
@@ -126,9 +112,9 @@ json_ref watchman_json_buffer::readJsonPrettyPdu(
   return res;
 }
 
-json_ref watchman_json_buffer::readJsonPdu(w_stm_t stm, json_error_t* jerr) {
-  int r;
-
+std::optional<json_ref> PduBuffer::readJsonPdu(
+    watchman_stream* stm,
+    json_error_t* jerr) {
   /* look for a newline; that indicates the end of
    * a json packet */
   auto nl = (char*)memchr(buf + rpos, '\n', wpos - rpos);
@@ -144,13 +130,13 @@ json_ref watchman_json_buffer::readJsonPdu(w_stm_t stm, json_error_t* jerr) {
         nl = buf + wpos;
         break;
       }
-      return nullptr;
+      return std::nullopt;
     }
     nl = (char*)memchr(buf + rpos, '\n', wpos - rpos);
   }
 
   // buflen
-  r = (int)(nl - (buf + rpos));
+  int r = (int)(nl - (buf + rpos));
   auto res = json_loadb(buf + rpos, r, 0, jerr);
 
   // update read pos to look beyond this point
@@ -159,8 +145,8 @@ json_ref watchman_json_buffer::readJsonPdu(w_stm_t stm, json_error_t* jerr) {
   return res;
 }
 
-bool watchman_json_buffer::decodePduInfo(
-    w_stm_t stm,
+bool PduBuffer::decodePduInfo(
+    watchman_stream* stm,
     uint32_t bser_version,
     json_int_t* len,
     json_int_t* bser_capabilities,
@@ -196,8 +182,8 @@ bool watchman_json_buffer::decodePduInfo(
   return true;
 }
 
-json_ref watchman_json_buffer::readBserPdu(
-    w_stm_t stm,
+std::optional<json_ref> PduBuffer::readBserPdu(
+    watchman_stream* stm,
     uint32_t bser_version,
     json_error_t* jerr) {
   json_int_t needed;
@@ -205,14 +191,13 @@ json_ref watchman_json_buffer::readBserPdu(
   json_int_t bser_capabilities;
   uint32_t ideal;
   int r;
-  json_ref obj;
 
   rpos += 2;
 
   // We don't handle EAGAIN cleanly in here
   stm->setNonBlock(false);
   if (!decodePduInfo(stm, bser_version, &val, &bser_capabilities, jerr)) {
-    return nullptr;
+    return std::nullopt;
   }
 
   // val tells us exactly how much storage we need for this PDU
@@ -230,7 +215,7 @@ json_ref watchman_json_buffer::readBserPdu(
             sizeof(jerr->text),
             "out of memory while allocating %" PRIu32 " bytes",
             ideal);
-        return nullptr;
+        return std::nullopt;
       }
 
       buf = newBuf;
@@ -253,12 +238,12 @@ json_ref watchman_json_buffer::readBserPdu(
           wpos,
           rpos,
           folly::errnoStr(errno).c_str());
-      return nullptr;
+      return std::nullopt;
     }
     wpos += r;
   }
 
-  obj = bunser(buf + rpos, buf + wpos, &needed, jerr);
+  std::optional<json_ref> obj = bunser(buf + rpos, buf + wpos, &needed, jerr);
   if (!obj) {
     // obj is a nullptr because deserialization failed. Log the message that
     // failed to deserialize to stderr
@@ -277,15 +262,12 @@ json_ref watchman_json_buffer::readBserPdu(
   return obj;
 }
 
-bool watchman_json_buffer::readAndDetectPdu(w_stm_t stm, json_error_t* jerr) {
-  enum w_pdu_type pdu;
-  // The client might send us different kinds of PDUs over the same connection,
-  // so reset the capabilities.
-  capabilities = 0;
+bool PduBuffer::readAndDetectPdu(watchman_stream* stm, json_error_t* jerr) {
+  PduFormat detected_format;
 
   shuntDown();
-  pdu = detectPdu();
-  if (pdu == need_data) {
+  detected_format.type = detectPdu();
+  if (detected_format.type == need_data) {
     if (!fillBuffer(stm)) {
       if (errno != EAGAIN) {
         snprintf(
@@ -296,13 +278,16 @@ bool watchman_json_buffer::readAndDetectPdu(w_stm_t stm, json_error_t* jerr) {
       }
       return false;
     }
-    pdu = detectPdu();
+    detected_format.type = detectPdu();
   }
 
-  if (pdu == is_bser_v2) {
+  constexpr size_t kCapSize = 4;
+  static_assert(kCapSize == sizeof(detected_format.capabilities));
+
+  if (detected_format.type == is_bser_v2) {
     // read capabilities (since we haven't increased rpos, first two bytes are
     // still the header)
-    while (wpos - rpos < 2 + sizeof(capabilities)) {
+    while (wpos - rpos < 2 + kCapSize) {
       if (!fillBuffer(stm)) {
         if (errno != EAGAIN) {
           snprintf(
@@ -316,16 +301,16 @@ bool watchman_json_buffer::readAndDetectPdu(w_stm_t stm, json_error_t* jerr) {
     }
 
     // Copy the capabilities over. BSER is system-endian so this is safe.
-    memcpy(&capabilities, buf + rpos + 2, sizeof(capabilities));
+    memcpy(&detected_format.capabilities, buf + rpos + 2, kCapSize);
   }
 
-  if (pdu == is_json_compact && stm == w_stm_stdin()) {
+  if (detected_format.type == is_json_compact && stm == w_stm_stdin()) {
     // Minor hack for the `-j` option for reading pretty printed
     // json from stdin
-    pdu = is_json_pretty;
+    detected_format.type = is_json_pretty;
   }
 
-  pdu_type = pdu;
+  format = detected_format;
   return true;
 }
 
@@ -351,14 +336,13 @@ static bool output_bytes(const char* buf, int x) {
   return true;
 }
 
-bool watchman_json_buffer::streamUntilNewLine(w_stm_t stm) {
-  int x;
-  char* localBuf;
+bool PduBuffer::streamUntilNewLine(watchman_stream* stm) {
   bool is_done = false;
 
   while (true) {
-    localBuf = buf + rpos;
+    char* localBuf = buf + rpos;
     auto nl = (char*)memchr(localBuf, '\n', wpos - rpos);
+    int x;
     if (nl) {
       x = 1 + (int)(nl - localBuf);
       is_done = true;
@@ -369,7 +353,6 @@ bool watchman_json_buffer::streamUntilNewLine(w_stm_t stm) {
     if (!output_bytes(localBuf, x)) {
       return false;
     }
-    localBuf += x;
     rpos += x;
 
     if (is_done) {
@@ -383,8 +366,8 @@ bool watchman_json_buffer::streamUntilNewLine(w_stm_t stm) {
   return true;
 }
 
-bool watchman_json_buffer::streamN(
-    w_stm_t stm,
+bool PduBuffer::streamN(
+    watchman_stream* stm,
     json_int_t len,
     json_error_t* jerr) {
   uint32_t total = 0;
@@ -400,7 +383,6 @@ bool watchman_json_buffer::streamN(
   }
   while (len > 0) {
     uint32_t avail = wpos - rpos;
-    int r;
 
     if (avail) {
       if (!output_bytes(buf + rpos, avail)) {
@@ -421,7 +403,7 @@ bool watchman_json_buffer::streamN(
     }
 
     avail = std::min((uint32_t)len, shuntDown());
-    r = stm->read(buf + wpos, avail);
+    int r = stm->read(buf + wpos, avail);
 
     if (r <= 0) {
       snprintf(
@@ -440,36 +422,37 @@ bool watchman_json_buffer::streamN(
   return true;
 }
 
-bool watchman_json_buffer::streamPdu(w_stm_t stm, json_error_t* jerr) {
-  uint32_t bser_version = 1;
-  json_int_t bser_capabilities;
-  json_int_t len;
-
-  switch (pdu_type) {
+bool PduBuffer::streamPdu(watchman_stream* stm, json_error_t* jerr) {
+  switch (format.type) {
     case is_json_compact:
     case is_json_pretty:
       return streamUntilNewLine(stm);
     case is_bser:
     case is_bser_v2: {
-      if (pdu_type == is_bser_v2) {
+      uint32_t bser_version;
+      if (format.type == is_bser_v2) {
         bser_version = 2;
       } else {
         bser_version = 1;
       }
       rpos += 2;
+      json_int_t bser_capabilities;
+      json_int_t len;
       if (!decodePduInfo(stm, bser_version, &len, &bser_capabilities, jerr)) {
         return false;
       }
       return streamN(stm, len, jerr);
     }
     default:
-      logf(FATAL, "not streaming for pdu type {}\n", pdu_type);
+      logf(FATAL, "not streaming for pdu type {}\n", format.type);
       return false;
   }
 }
 
-json_ref watchman_json_buffer::decodePdu(w_stm_t stm, json_error_t* jerr) {
-  switch (pdu_type) {
+std::optional<json_ref> PduBuffer::decodePdu(
+    watchman_stream* stm,
+    json_error_t* jerr) {
+  switch (format.type) {
     case is_json_compact:
       return readJsonPdu(stm, jerr);
     case is_json_pretty:
@@ -481,61 +464,25 @@ json_ref watchman_json_buffer::decodePdu(w_stm_t stm, json_error_t* jerr) {
   }
 }
 
-bool watchman_json_buffer::passThru(
-    enum w_pdu_type output_pdu,
-    uint32_t output_capabilities,
-    w_jbuffer_t* output_pdu_buf,
-    w_stm_t stm) {
-  json_error_t jerr;
-  bool res;
-
-  stm->setNonBlock(false);
-  if (!readAndDetectPdu(stm, &jerr)) {
-    logf(ERR, "failed to identify PDU: {}\n", jerr.text);
-    return false;
-  }
-
-  if (pdu_type == output_pdu) {
-    // We can stream it through
-    if (!streamPdu(stm, &jerr)) {
-      logf(ERR, "stream_pdu: {}\n", jerr.text);
-      return false;
-    }
-    return true;
-  }
-
-  auto j = decodePdu(stm, &jerr);
-
-  if (!j) {
-    logf(ERR, "failed to parse response: {}\n", jerr.text);
-    return false;
-  }
-
-  output_pdu_buf->clear();
-
-  res = output_pdu_buf->pduEncodeToStream(
-      output_pdu, output_capabilities, j, w_stm_stdout());
-
-  return res;
-}
-
-json_ref watchman_json_buffer::decodeNext(w_stm_t stm, json_error_t* jerr) {
+std::optional<json_ref> PduBuffer::decodeNext(
+    watchman_stream* stm,
+    json_error_t* jerr) {
   *jerr = json_error_t();
   if (!readAndDetectPdu(stm, jerr)) {
-    return nullptr;
+    return std::nullopt;
   }
   return decodePdu(stm, jerr);
 }
 
+namespace {
+
 struct jbuffer_write_data {
-  w_stm_t stm;
-  w_jbuffer_t* jr;
+  watchman_stream* stm;
+  PduBuffer* jr;
 
   bool flush() {
-    int x;
-
     while (jr->wpos - jr->rpos) {
-      x = stm->write(jr->buf + jr->rpos, jr->wpos - jr->rpos);
+      int x = stm->write(jr->buf + jr->rpos, jr->wpos - jr->rpos);
 
       if (x <= 0) {
         return false;
@@ -582,63 +529,71 @@ struct jbuffer_write_data {
   }
 };
 
-bool watchman_json_buffer::bserEncodeToStream(
+} // namespace
+
+ResultErrno<folly::Unit> PduBuffer::bserEncodeToStream(
     uint32_t bser_version,
     uint32_t bser_capabilities,
     const json_ref& json,
-    w_stm_t stm) {
-  struct jbuffer_write_data data = {stm, this};
-  int res;
+    watchman_stream* stm) {
+  jbuffer_write_data data = {stm, this};
 
-  res = w_bser_write_pdu(
+  int res = w_bser_write_pdu(
       bser_version, bser_capabilities, jbuffer_write_data::write, json, &data);
 
   if (res != 0) {
-    return false;
+    return errno;
   }
 
-  return data.flush();
+  if (!data.flush()) {
+    return errno;
+  }
+
+  return folly::unit;
 }
 
-bool watchman_json_buffer::jsonEncodeToStream(
+ResultErrno<folly::Unit> PduBuffer::jsonEncodeToStream(
     const json_ref& json,
-    w_stm_t stm,
+    watchman_stream* stm,
     int flags) {
-  struct jbuffer_write_data data = {stm, this};
-  int res;
+  jbuffer_write_data data = {stm, this};
 
-  res = json_dump_callback(json, jbuffer_write_data::write, &data, flags);
-
+  int res = json_dump_callback(json, jbuffer_write_data::write, &data, flags);
   if (res != 0) {
-    return false;
+    return errno;
   }
 
   if (data.write("\n", 1) != 0) {
-    return false;
+    return errno;
   }
 
-  return data.flush();
+  if (!data.flush()) {
+    return errno;
+  }
+
+  return folly::unit;
 }
 
-bool watchman_json_buffer::pduEncodeToStream(
-    enum w_pdu_type pdu_type,
-    uint32_t capabilities,
+ResultErrno<folly::Unit> PduBuffer::pduEncodeToStream(
+    PduFormat format,
     const json_ref& json,
-    w_stm_t stm) {
-  switch (pdu_type) {
+    watchman_stream* stm) {
+  switch (format.type) {
     case is_json_compact:
       return jsonEncodeToStream(json, stm, JSON_COMPACT);
     case is_json_pretty:
       return jsonEncodeToStream(json, stm, JSON_INDENT(4));
     case is_bser:
-      return bserEncodeToStream(1, capabilities, json, stm);
+      return bserEncodeToStream(1, format.capabilities, json, stm);
     case is_bser_v2:
-      return bserEncodeToStream(2, capabilities, json, stm);
+      return bserEncodeToStream(2, format.capabilities, json, stm);
     case need_data:
     default:
-      return false;
+      return EINVAL;
   }
 }
 
 /* vim:ts=2:sw=2:et:
  */
+
+} // namespace watchman

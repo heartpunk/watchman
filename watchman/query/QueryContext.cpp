@@ -26,7 +26,8 @@ std::optional<json_ref> file_result_to_json(
   if (fieldList.size() == 1) {
     return fieldList.front()->make(file.get(), ctx);
   }
-  auto value = json_object_of_size(fieldList.size());
+  std::unordered_map<w_string, json_ref> value;
+  value.reserve(fieldList.size());
 
   for (auto& f : fieldList) {
     auto ele = f->make(file.get(), ctx);
@@ -34,9 +35,9 @@ std::optional<json_ref> file_result_to_json(
       // Need data to be loaded
       return std::nullopt;
     }
-    value.set(f->name, std::move(ele.value()));
+    value.insert_or_assign(f->name, std::move(ele.value()));
   }
-  return value;
+  return json_object(std::move(value));
 }
 
 } // namespace
@@ -139,19 +140,13 @@ void QueryContext::fetchEvalBatchNow() {
   w_assert(evalBatch_.empty(), "should have no files that NeedDataLoad");
 }
 
-json_ref QueryContext::renderResults() {
-  // build a template for the serializer
-  auto results = json_array();
+RenderResult QueryContext::renderResults() {
+  std::optional<json_ref> templ;
   if (query->fieldList.size() > 1) {
-    json_array_set_template_new(
-        results, field_list_to_json_name_array(query->fieldList));
+    // build a template for the serializer
+    templ = field_list_to_json_name_array(query->fieldList);
   }
-
-  for (auto& result : resultsArray) {
-    json_array_append_new(results, std::move(result));
-  }
-
-  return results;
+  return RenderResult{std::move(resultsArray), std::move(templ)};
 }
 
 void QueryContext::maybeRender(std::unique_ptr<FileResult>&& file) {

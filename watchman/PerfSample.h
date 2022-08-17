@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <folly/portability/SysTime.h>
 #include <string>
 #include <vector>
 #include "watchman/thirdparty/jansson/jansson.h"
@@ -48,7 +49,11 @@ class PerfSample {
   struct rusage usage;
 #endif
 
-  // Initialize and mark the start of a sample
+  /**
+   * Initialize and mark the start of a sample.
+   * The given description is an unowned pointer - it must live as long as the
+   * PerfSample.
+   */
   explicit PerfSample(const char* description);
 
   PerfSample(const PerfSample&) = delete;
@@ -79,7 +84,7 @@ void perf_shutdown();
 void processSamples(
     size_t argv_limit,
     size_t maximum_batch_size,
-    json_ref samples,
+    std::vector<json_ref>& samples,
     std::function<void(std::vector<std::string>)> command_line,
     std::function<void(std::string)> single_large_sample);
 

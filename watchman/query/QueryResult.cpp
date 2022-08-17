@@ -9,13 +9,21 @@
 
 namespace watchman {
 
+json_ref RenderResult::toJson() && {
+  auto arr = json_array(std::move(results));
+  if (templ) {
+    json_array_set_template_new(arr, std::move(*templ));
+  }
+  return arr;
+}
+
 json_ref QueryDebugInfo::render() const {
-  auto arr = json_array();
+  std::vector<json_ref> arr;
   for (auto& fn : cookieFileNames) {
-    json_array_append(arr, w_string_to_json(fn));
+    arr.push_back(w_string_to_json(fn));
   }
   return json_object({
-      {"cookie_files", arr},
+      {"cookie_files", json_array(std::move(arr))},
   });
 }
 

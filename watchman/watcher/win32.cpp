@@ -8,6 +8,7 @@
 #include <folly/Synchronized.h>
 #include "watchman/InMemoryView.h"
 #include "watchman/fs/FileDescriptor.h"
+#include "watchman/portability/WinError.h"
 #include "watchman/root/Root.h"
 #include "watchman/watcher/Watcher.h"
 #include "watchman/watcher/WatcherRegistry.h"
@@ -50,7 +51,6 @@ struct WinWatcher : public Watcher {
 
   std::unique_ptr<DirHandle> startWatchDir(
       const std::shared_ptr<Root>& root,
-      struct watchman_dir* dir,
       const char* path) override;
 
   Watcher::ConsumeNotifyRet consumeNotify(
@@ -369,7 +369,6 @@ bool WinWatcher::start(const std::shared_ptr<Root>& root) {
 
 std::unique_ptr<DirHandle> WinWatcher::startWatchDir(
     const std::shared_ptr<Root>& root,
-    struct watchman_dir* dir,
     const char* path) {
   return openDir(path);
 }

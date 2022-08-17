@@ -74,7 +74,7 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
         )
 
         self.assertListEqual(
-            [u"bar", u"foo"],
+            ["bar", "foo"],
             sorted(
                 self.watchmanCommand(
                     "subscribe",
@@ -100,7 +100,7 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
         )
 
         self.touchRelative(root, "a")
-        self.assertNotEqual(None, self.waitForSub("defer", root=root))
+        self.assertNotEqual(None, self.waitForSubFileList("defer", root, ["a"]))
 
         def isStateEnterFoo(sub):
             for item in sub:
@@ -167,7 +167,7 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
         self.assertEqual("leavemeta", end["metadata"])
 
         # and now we should observe the file change
-        self.assertNotEqual(None, self.waitForSub("defer", root))
+        self.assertNotEqual(None, self.waitForSubFileList("defer", root, ["in-foo-3"]))
 
     def test_drop_state(self) -> None:
         root = self.mkdtemp()
@@ -179,10 +179,13 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
         self.assertNotEqual(None, self.waitForSub("drop", root=root))
 
         self.touchRelative(root, "a")
-        self.assertNotEqual(None, self.waitForSub("drop", root=root))
+        subResult = self.waitForSubFileList("drop", root, ["a"])
+        self.assertNotEqual(None, subResult)
 
         self.watchmanCommand("state-enter", root, "foo")
-        begin = self.waitForSub("drop", root)[0]
+        subResult = self.waitForSub("drop", root)
+        print(subResult)
+        begin = subResult[0]
         self.assertEqual("foo", begin["state-enter"])
 
         self.touchRelative(root, "in-foo")
@@ -219,7 +222,7 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
         self.touchRelative(root, "out-foo")
 
         self.assertFileList(root, files=["a", "in-foo", "in-foo-2", "out-foo"])
-        self.assertNotEqual(None, self.waitForSub("drop", root))
+        self.assertNotEqual(None, self.waitForSubFileList("drop", root, ["out-foo"]))
 
     def test_defer_vcs(self) -> None:
         root = self.mkdtemp()
@@ -671,7 +674,7 @@ class TestSubscribe(WatchmanTestCase.WatchmanTestCase):
     @unittest.skipIf(os.name == "nt", "win")
     @WatchmanTestCase.skip_for(codecs=["json"])
     def test_subscribe_unicode(self) -> None:
-        unicode_filename = u"\u263a"
+        unicode_filename = "\u263a"
 
         root = self.mkdtemp()
         a_dir = os.path.join(root, "a")

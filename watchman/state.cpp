@@ -81,7 +81,7 @@ bool w_state_load() {
 
   state_saver_thread = std::thread(state_saver);
 
-  json_ref state;
+  std::optional<json_ref> state;
   try {
     state = json_load_file(flags.watchman_state_file.c_str(), 0);
   } catch (const std::system_error& exc) {
@@ -104,7 +104,7 @@ bool w_state_load() {
     return false;
   }
 
-  if (!w_root_load_state(state)) {
+  if (!w_root_load_state(state.value())) {
     return false;
   }
 
@@ -112,7 +112,7 @@ bool w_state_load() {
 }
 
 static bool do_state_save() {
-  w_jbuffer_t buffer;
+  PduBuffer buffer;
 
   auto state = json_object();
 
@@ -154,7 +154,7 @@ void w_state_save() {
 bool w_root_save_state(json_ref& state) {
   bool result = true;
 
-  auto watched_dirs = json_array();
+  std::vector<json_ref> watched_dirs;
 
   logf(DBG, "saving state\n");
 
@@ -170,11 +170,11 @@ bool w_root_save_state(json_ref& state) {
       auto triggers = root->triggerListToJson();
       json_object_set_new(obj, "triggers", std::move(triggers));
 
-      json_array_append_new(watched_dirs, std::move(obj));
+      watched_dirs.push_back(std::move(obj));
     }
   }
 
-  json_object_set_new(state, "watched", std::move(watched_dirs));
+  json_object_set_new(state, "watched", json_array(std::move(watched_dirs)));
 
   return result;
 }
@@ -182,23 +182,23 @@ bool w_root_save_state(json_ref& state) {
 bool w_root_load_state(const json_ref& state) {
   size_t i;
 
-  auto watched = state.get_default("watched");
+  auto watched = state.get_optional("watched");
   if (!watched) {
     return true;
   }
 
-  if (!watched.isArray()) {
+  if (!watched->isArray()) {
     return false;
   }
 
-  for (i = 0; i < json_array_size(watched); i++) {
-    const auto& obj = watched.at(i);
+  for (i = 0; i < json_array_size(*watched); i++) {
+    const auto& obj = watched->at(i);
     bool created = false;
-    const char* filename;
     size_t j;
 
-    auto triggers = obj.get_default("triggers");
-    filename = json_string_value(json_object_get(obj, "path"));
+    auto triggers = obj.get("triggers");
+    auto path = json_object_get(obj, "path");
+    const char* filename = path ? json_string_value(*path) : nullptr;
 
     std::shared_ptr<Root> root;
     try {
@@ -216,7 +216,7 @@ bool w_root_load_state(const json_ref& state) {
         const auto& tobj = triggers.at(j);
 
         // Legacy rules format
-        auto rarray = tobj.get_default("rules");
+        auto rarray = tobj.get_optional("rules");
         if (rarray) {
           continue;
         }

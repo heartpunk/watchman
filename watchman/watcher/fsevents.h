@@ -11,13 +11,13 @@
 #include "watchman/RingBuffer.h"
 #include "watchman/fs/Pipe.h"
 #include "watchman/watcher/Watcher.h"
+#include "watchman/watchman_cmd.h"
 
 #if HAVE_FSEVENTS
 
-struct watchman_client;
-
 namespace watchman {
 
+class Client;
 class Configuration;
 struct FSEventsStream;
 struct FSEventsLogEntry;
@@ -49,7 +49,6 @@ class FSEventsWatcher : public Watcher {
 
   std::unique_ptr<DirHandle> startWatchDir(
       const std::shared_ptr<Root>& root,
-      struct watchman_dir* dir,
       const char* path) override;
 
   Watcher::ConsumeNotifyRet consumeNotify(
@@ -63,8 +62,8 @@ class FSEventsWatcher : public Watcher {
   json_ref getDebugInfo() override;
   void clearDebugInfo() override;
 
-  static void cmd_debug_fsevents_inject_drop(
-      watchman_client* client,
+  static UntypedResponse cmd_debug_fsevents_inject_drop(
+      Client* client,
       const json_ref& args);
 
  private:

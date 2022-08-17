@@ -8,6 +8,7 @@
 #include <folly/Synchronized.h>
 #include <condition_variable>
 #include <mutex>
+#include "watchman/Client.h"
 #include "watchman/InMemoryView.h"
 #include "watchman/root/Root.h"
 #include "watchman/watcher/WatcherRegistry.h"
@@ -93,7 +94,6 @@ class KQueueAndFSEventsWatcher : public Watcher {
 
   std::unique_ptr<DirHandle> startWatchDir(
       const std::shared_ptr<Root>& root,
-      struct watchman_dir* dir,
       const char* path) override;
 
   bool startWatchFile(struct watchman_file* file) override;
@@ -185,31 +185,32 @@ folly::SemiFuture<folly::Unit> KQueueAndFSEventsWatcher::flushPendingEvents() {
 
 std::unique_ptr<DirHandle> KQueueAndFSEventsWatcher::startWatchDir(
     const std::shared_ptr<Root>& root,
-    struct watchman_dir* dir,
     const char* path) {
-  if (!dir->parent) {
+  if (root->root_path == path) {
     logf(DBG, "Watching root directory with kqueue\n");
     // This is the root, let's watch it with kqueue.
-    kqueueWatcher_->startWatchDir(root, dir, path);
-  } else if (dir->parent->getFullPath() == root->root_path) {
-    auto fullPath = dir->getFullPath();
-    auto wlock = fseventWatchers_.wlock();
-    if (wlock->find(fullPath) == wlock->end()) {
-      logf(
-          DBG,
-          "Creating a new FSEventsWatcher for top-level directory {}\n",
-          dir->name);
-      root->cookies.addCookieDir(fullPath);
-      auto [it, _] = wlock->emplace(
-          fullPath,
-          std::make_shared<FSEventsWatcher>(
-              false, root->config, std::optional(fullPath)));
-      const auto& watcher = it->second;
-      if (!watcher->start(root)) {
-        throw std::runtime_error("couldn't start fsEvent");
-      }
-      if (!startThread(root, watcher, pendingCondition_)) {
-        throw std::runtime_error("couldn't start fsEvent");
+    kqueueWatcher_->startWatchDir(root, path);
+  } else {
+    w_string fullPath{path};
+    if (root->root_path == fullPath.dirName()) {
+      auto wlock = fseventWatchers_.wlock();
+      if (wlock->find(fullPath) == wlock->end()) {
+        logf(
+            DBG,
+            "Creating a new FSEventsWatcher for top-level directory {}\n",
+            fullPath);
+        root->cookies.addCookieDir(fullPath);
+        auto [it, _] = wlock->emplace(
+            fullPath,
+            std::make_shared<FSEventsWatcher>(
+                false, root->config, std::optional(fullPath)));
+        const auto& watcher = it->second;
+        if (!watcher->start(root)) {
+          throw std::runtime_error("couldn't start fsEvent");
+        }
+        if (!startThread(root, watcher, pendingCondition_)) {
+          throw std::runtime_error("couldn't start fsEvent");
+        }
       }
     }
   }
@@ -315,39 +316,33 @@ std::shared_ptr<KQueueAndFSEventsWatcher> watcherFromRoot(
       view->getWatcher());
 }
 
-static void cmd_debug_kqueue_and_fsevents_recrawl(
-    struct watchman_client* client,
+static UntypedResponse cmd_debug_kqueue_and_fsevents_recrawl(
+    Client* client,
     const json_ref& args) {
   /* resolve the root */
   if (json_array_size(args) != 3) {
-    send_error_response(
-        client,
+    throw ErrorResponse(
         "wrong number of arguments for 'debug-kqueue-and-fsevents-recrawl'");
-    return;
   }
 
   auto root = resolveRoot(client, args);
 
   auto watcher = watcherFromRoot(root);
   if (!watcher) {
-    send_error_response(
-        client, "root is not using the kqueue+fsevents watcher");
-    return;
+    throw ErrorResponse("root is not using the kqueue+fsevents watcher");
   }
 
   /* Get the path that the recrawl should be triggered on */
   const auto& json_path = args.at(2);
   auto path = json_string_value(json_path);
   if (!path) {
-    send_error_response(
-        client,
+    throw ErrorResponse(
         "invalid value for argument 2, expected a string naming the path to trigger a recrawl on");
   }
 
   watcher->injectRecrawl(path);
 
-  auto resp = make_response();
-  send_and_dispose_response(client, std::move(resp));
+  return UntypedResponse{};
 }
 
 } // namespace
@@ -356,7 +351,7 @@ W_CMD_REG(
     "debug-kqueue-and-fsevents-recrawl",
     cmd_debug_kqueue_and_fsevents_recrawl,
     CMD_DAEMON,
-    w_cmd_realpath_root)
+    w_cmd_realpath_root);
 
 } // namespace watchman
 

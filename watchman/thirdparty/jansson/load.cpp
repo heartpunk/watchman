@@ -429,14 +429,10 @@ out:
   lex->value.string.clear();
 }
 
-#if JSON_INTEGER_IS_LONG_LONG
 #ifdef _MSC_VER // Microsoft Visual Studio
 #define json_strtoint _strtoi64
 #else
 #define json_strtoint strtoll
-#endif
-#else
-#define json_strtoint strtol
 #endif
 
 static int lex_scan_number(lex_t* lex, int c, json_error_t* error) {
@@ -614,9 +610,9 @@ static int lex_init(lex_t* lex, get_func get, void* data) {
 
 /*** parser ***/
 
-static json_ref parse_value(lex_t* lex, size_t flags, json_error_t* error);
+static std::optional<json_ref> parse_value(lex_t* lex, size_t flags, json_error_t* error);
 
-static json_ref parse_object(lex_t* lex, size_t flags, json_error_t* error) {
+static std::optional<json_ref> parse_object(lex_t* lex, size_t flags, json_error_t* error) {
   auto object = json_object();
 
   lex_scan(lex, error);
@@ -624,39 +620,37 @@ static json_ref parse_object(lex_t* lex, size_t flags, json_error_t* error) {
     return object;
 
   while (1) {
-    json_ref value;
-
     if (lex->token != TOKEN_STRING) {
       error_set(error, lex, "string or '}' expected");
-      return nullptr;
+      return std::nullopt;
     }
 
     auto key = lex_steal_string(lex);
     if (key.empty()) {
-      return nullptr;
+      return std::nullopt;
     }
 
     if (flags & JSON_REJECT_DUPLICATES) {
       if (json_object_get(object, key.c_str())) {
         error_set(error, lex, "duplicate object key");
-        return nullptr;
+        return std::nullopt;
       }
     }
 
     lex_scan(lex, error);
     if (lex->token != ':') {
       error_set(error, lex, "':' expected");
-      return nullptr;
+      return std::nullopt;
     }
 
     lex_scan(lex, error);
-    value = parse_value(lex, flags, error);
+    std::optional<json_ref> value = parse_value(lex, flags, error);
     if (!value) {
-      return nullptr;
+      return std::nullopt;
     }
 
-    if (json_object_set_nocheck(object, key.c_str(), value)) {
-      return nullptr;
+    if (json_object_set_nocheck(object, key.c_str(), *value)) {
+      return std::nullopt;
     }
 
     lex_scan(lex, error);
@@ -668,29 +662,25 @@ static json_ref parse_object(lex_t* lex, size_t flags, json_error_t* error) {
 
   if (lex->token != '}') {
     error_set(error, lex, "'}' expected");
-    return nullptr;
+    return std::nullopt;
   }
 
   return object;
 }
 
-static json_ref parse_array(lex_t* lex, size_t flags, json_error_t* error) {
-  auto array = json_array();
-  if (!array)
-    return nullptr;
+static std::optional<json_ref> parse_array(lex_t* lex, size_t flags, json_error_t* error) {
+  std::vector<json_ref> array;
 
   lex_scan(lex, error);
   if (lex->token == ']')
-    return array;
+    return json_array(array);
 
   while (lex->token) {
     auto elem = parse_value(lex, flags, error);
     if (!elem)
       goto error;
 
-    if (json_array_append(array, elem)) {
-      goto error;
-    }
+    array.push_back(std::move(*elem));
 
     lex_scan(lex, error);
     if (lex->token != ',')
@@ -704,86 +694,66 @@ static json_ref parse_array(lex_t* lex, size_t flags, json_error_t* error) {
     goto error;
   }
 
-  return array;
+  return json_array(std::move(array));
 
 error:
-  return nullptr;
+  return std::nullopt;
 }
 
-static json_ref parse_value(lex_t* lex, size_t flags, json_error_t* error) {
-  json_ref json;
-
+static std::optional<json_ref> parse_value(lex_t* lex, size_t flags, json_error_t* error) {
   switch (lex->token) {
-    case TOKEN_STRING: {
-      json = typed_string_to_json(lex->value.string.c_str(), W_STRING_BYTE);
-      break;
-    }
+    case TOKEN_STRING:
+      return typed_string_to_json(lex->value.string.c_str(), W_STRING_BYTE);
 
-    case TOKEN_INTEGER: {
-      json = json_integer(lex->value.integer);
-      break;
-    }
+    case TOKEN_INTEGER:
+      return json_integer(lex->value.integer);
 
-    case TOKEN_REAL: {
-      json = json_real(lex->value.real);
-      break;
-    }
+    case TOKEN_REAL:
+      return json_real(lex->value.real);
 
     case TOKEN_TRUE:
-      json = json_true();
-      break;
+      return json_true();
 
     case TOKEN_FALSE:
-      json = json_false();
-      break;
+      return json_false();
 
     case TOKEN_NULL:
-      json = json_null();
-      break;
+      return json_null();
 
     case '{':
-      json = parse_object(lex, flags, error);
-      break;
+      return parse_object(lex, flags, error);
 
     case '[':
-      json = parse_array(lex, flags, error);
-      break;
+      return parse_array(lex, flags, error);
 
     case TOKEN_INVALID:
       error_set(error, lex, "invalid token");
-      return nullptr;
+      return std::nullopt;
 
     default:
       error_set(error, lex, "unexpected token");
-      return nullptr;
+      return std::nullopt;
   }
-
-  if (!json)
-    return nullptr;
-
-  return json;
 }
 
-static json_ref parse_json(lex_t* lex, size_t flags, json_error_t* error) {
-  json_ref result;
-
+static std::optional<json_ref> parse_json(lex_t* lex, size_t flags, json_error_t* error) {
   lex_scan(lex, error);
   if (!(flags & JSON_DECODE_ANY)) {
     if (lex->token != '[' && lex->token != '{') {
       error_set(error, lex, "'[' or '{' expected");
-      return nullptr;
+      return std::nullopt;
     }
   }
 
-  result = parse_value(lex, flags, error);
+  auto result = parse_value(lex, flags, error);
   if (!result)
-    return nullptr;
+    return std::nullopt;
 
   if (!(flags & JSON_DISABLE_EOF_CHECK)) {
     lex_scan(lex, error);
     if (lex->token != TOKEN_EOF) {
       error_set(error, lex, "end of file expected");
-      return nullptr;
+      return std::nullopt;
     }
   }
 
@@ -812,7 +782,7 @@ static int string_get(void* data) {
   }
 }
 
-json_ref json_loads(const char* string, size_t flags, json_error_t* error) {
+std::optional<json_ref> json_loads(const char* string, size_t flags, json_error_t* error) {
   lex_t lex;
   string_data_t stream_data;
 
@@ -820,18 +790,16 @@ json_ref json_loads(const char* string, size_t flags, json_error_t* error) {
 
   if (string == nullptr) {
     error_set(error, nullptr, "wrong arguments");
-    return nullptr;
+    return std::nullopt;
   }
 
   stream_data.data = string;
   stream_data.pos = 0;
 
   if (lex_init(&lex, string_get, (void*)&stream_data))
-    return nullptr;
+    return std::nullopt;
 
-  auto result = parse_json(&lex, flags, error);
-
-  return result;
+  return parse_json(&lex, flags, error);
 }
 
 typedef struct {
@@ -851,7 +819,7 @@ static int buffer_get(void* data) {
   return (unsigned char)c;
 }
 
-json_ref json_loadb(
+std::optional<json_ref> json_loadb(
     const char* buffer,
     size_t buflen,
     size_t flags,
@@ -863,7 +831,7 @@ json_ref json_loadb(
 
   if (buffer == nullptr) {
     error_set(error, nullptr, "wrong arguments");
-    return nullptr;
+    return std::nullopt;
   }
 
   stream_data.data = buffer;
@@ -871,14 +839,12 @@ json_ref json_loadb(
   stream_data.len = buflen;
 
   if (lex_init(&lex, buffer_get, (void*)&stream_data))
-    return nullptr;
+    return std::nullopt;
 
-  auto result = parse_json(&lex, flags, error);
-
-  return result;
+  return parse_json(&lex, flags, error);
 }
 
-json_ref json_loadf(FILE* input, size_t flags, json_error_t* error) {
+std::optional<json_ref> json_loadf(FILE* input, size_t flags, json_error_t* error) {
   lex_t lex;
   const char* source;
 
@@ -891,15 +857,13 @@ json_ref json_loadf(FILE* input, size_t flags, json_error_t* error) {
 
   if (input == nullptr) {
     error_set(error, nullptr, "wrong arguments");
-    return nullptr;
+    return std::nullopt;
   }
 
   if (lex_init(&lex, (get_func)fgetc, input))
-    return nullptr;
+    return std::nullopt;
 
-  auto result = parse_json(&lex, flags, error);
-
-  return result;
+  return parse_json(&lex, flags, error);
 }
 
 json_ref json_load_file(const char* path, size_t flags) {
@@ -928,5 +892,5 @@ json_ref json_load_file(const char* path, size_t flags) {
           "failed to parse json from ", path, ": ", error.text));
   }
 
-  return result;
+  return *result;
 }

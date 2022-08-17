@@ -8,10 +8,13 @@
 //! This module defines the request and response PDU types used by the
 //! watchman protocol.
 
-use crate::expr::Expr;
-use serde::{Deserialize, Serialize};
-use serde_bser::value::Value;
 use std::path::PathBuf;
+
+use serde::Deserialize;
+use serde::Serialize;
+use serde_bser::value::Value;
+
+use crate::expr::Expr;
 
 /// The `get-sockname` command response
 #[derive(Deserialize, Debug)]
@@ -739,6 +742,7 @@ pub enum FileType {
     Symlink,
     Socket,
     SolarisDoor,
+    Unknown,
 }
 
 impl std::string::ToString for FileType {
@@ -758,6 +762,7 @@ impl From<String> for FileType {
             "l" => Self::Symlink,
             "s" => Self::Socket,
             "D" => Self::SolarisDoor,
+            "?" => Self::Unknown,
             unknown => panic!("Watchman Server returned impossible file type {}", unknown),
         }
     }
@@ -774,6 +779,7 @@ impl Into<String> for FileType {
             Self::Symlink => "l",
             Self::Socket => "s",
             Self::SolarisDoor => "D",
+            Self::Unknown => "?",
         }
         .to_string()
     }
@@ -781,10 +787,12 @@ impl Into<String> for FileType {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_bser::value::Value;
+
     use super::*;
     use crate::bunser;
-    use serde_bser::value::Value;
-    use std::collections::HashMap;
 
     fn convert_bser_value<T>(input: Value) -> T
     where

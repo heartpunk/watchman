@@ -12,6 +12,7 @@
 #include <iterator>
 #include <mutex>
 #include <vector>
+#include "watchman/Client.h"
 #include "watchman/FlagMap.h"
 #include "watchman/InMemoryView.h"
 #include "watchman/LogConfig.h"
@@ -806,7 +807,6 @@ void FSEventsWatcher::stopThreads() {
 
 std::unique_ptr<DirHandle> FSEventsWatcher::startWatchDir(
     const std::shared_ptr<Root>&,
-    watchman_dir*,
     const char* path) {
   return openDir(path);
 }
@@ -814,10 +814,11 @@ std::unique_ptr<DirHandle> FSEventsWatcher::startWatchDir(
 json_ref FSEventsWatcher::getDebugInfo() {
   json_ref events = json_null();
   if (ringBuffer_) {
-    events = json_array();
+    std::vector<json_ref> elements;
     for (auto& entry : ringBuffer_->readAll()) {
-      json_array_append(events, entry.asJsonValue());
+      elements.push_back(entry.asJsonValue());
     }
+    events = json_array(std::move(elements));
   }
   return json_object({
       {"events", events},
@@ -839,27 +840,24 @@ static RegisterWatcher<FSEventsWatcher> reg("fsevents");
 
 // A helper command to facilitate testing that we can successfully
 // resync the stream.
-void FSEventsWatcher::cmd_debug_fsevents_inject_drop(
-    watchman_client* client,
+UntypedResponse FSEventsWatcher::cmd_debug_fsevents_inject_drop(
+    Client* client,
     const json_ref& args) {
   /* resolve the root */
   if (json_array_size(args) != 2) {
-    send_error_response(
-        client, "wrong number of arguments for 'debug-fsevents-inject-drop'");
-    return;
+    throw ErrorResponse(
+        "wrong number of arguments for 'debug-fsevents-inject-drop'");
   }
 
   auto root = resolveRoot(client, args);
 
   auto watcher = watcherFromRoot(root);
   if (!watcher) {
-    send_error_response(client, "root is not using the fsevents watcher");
-    return;
+    throw ErrorResponse("root is not using the fsevents watcher");
   }
 
   if (!watcher->attemptResyncOnDrop_) {
-    send_error_response(client, "fsevents_try_resync is not enabled");
-    return;
+    throw ErrorResponse("fsevents_try_resync is not enabled");
   }
 
   FSEventStreamEventId last_good;
@@ -870,15 +868,15 @@ void FSEventsWatcher::cmd_debug_fsevents_inject_drop(
     watcher->stream_->inject_drop = true;
   }
 
-  auto resp = make_response();
+  UntypedResponse resp;
   resp.set("last_good", json_integer(last_good));
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
 W_CMD_REG(
     "debug-fsevents-inject-drop",
     FSEventsWatcher::cmd_debug_fsevents_inject_drop,
     CMD_DAEMON,
-    w_cmd_realpath_root)
+    w_cmd_realpath_root);
 
 } // namespace watchman
 

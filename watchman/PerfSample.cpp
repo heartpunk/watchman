@@ -26,7 +26,7 @@ class PerfLogThread {
     explicit State(bool start) : running(start) {}
 
     bool running;
-    json_ref samples;
+    std::vector<json_ref> samples;
   };
 
   folly::Synchronized<State, std::mutex> state_;
@@ -60,10 +60,7 @@ class PerfLogThread {
 
   void addSample(json_ref&& sample) {
     auto wlock = state_.lock();
-    if (!wlock->samples) {
-      wlock->samples = json_array();
-    }
-    json_array_append_new(wlock->samples, std::move(sample));
+    wlock->samples.push_back(std::move(sample));
     cond_.notify_one();
   }
 };
@@ -79,12 +76,12 @@ PerfLogThread& getPerfThread(bool start = true) {
 void processSamples(
     size_t argv_limit,
     size_t maximum_batch_size,
-    json_ref samples,
+    std::vector<json_ref>& samples,
     std::function<void(std::vector<std::string>)> command_line,
     std::function<void(std::string)> single_large_sample) {
-  while (json_array_size(samples) > 0) {
-    std::string encoded_sample = json_dumps(json_array_get(samples, 0), 0);
-    json_array_remove(samples, 0);
+  while (samples.size() > 0) {
+    std::string encoded_sample = json_dumps(samples.front(), 0);
+    samples.erase(samples.begin()); // O(N^2)
 
     if (encoded_sample.size() > argv_limit) {
       single_large_sample(std::move(encoded_sample));
@@ -93,12 +90,12 @@ void processSamples(
       args.push_back(std::move(encoded_sample));
       size_t arg_size = encoded_sample.size() + 1;
 
-      while (args.size() < maximum_batch_size && json_array_size(samples) > 0) {
-        encoded_sample = json_dumps(json_array_get(samples, 0), 0);
+      while (args.size() < maximum_batch_size && samples.size() > 0) {
+        encoded_sample = json_dumps(samples[0], 0);
         if (arg_size + encoded_sample.size() + 1 > argv_limit) {
           break;
         }
-        json_array_remove(samples, 0);
+        samples.erase(samples.begin()); // O(N^2)
         arg_size += encoded_sample.size() + 1;
         args.push_back(std::move(encoded_sample));
       }
@@ -145,11 +142,11 @@ bool PerfSample::finish() {
     if (wall_time_elapsed_thresh == 0) {
       auto thresh = cfg_get_json("perf_sampling_thresh");
       if (thresh) {
-        if (thresh.isNumber()) {
-          wall_time_elapsed_thresh = json_number_value(thresh);
+        if (thresh->isNumber()) {
+          wall_time_elapsed_thresh = json_number_value(*thresh);
         } else {
           wall_time_elapsed_thresh = json_number_value(
-              thresh.get_default(description, json_real(0.0)));
+              thresh->get_default(description, json_real(0.0)));
         }
       }
     }
@@ -176,8 +173,7 @@ void PerfSample::force_log() {
 }
 
 void PerfLogThread::loop() noexcept {
-  json_ref samples;
-  json_ref perf_cmd;
+  std::vector<json_ref> samples;
   int64_t sample_batch;
 
   w_set_thread_name("perflog");
@@ -185,7 +181,7 @@ void PerfLogThread::loop() noexcept {
   auto stateDir =
       w_string_piece(flags.watchman_state_file).dirName().asWString();
 
-  perf_cmd = cfg_get_json("perf_logger_command");
+  json_ref perf_cmd = cfg_get_json("perf_logger_command").value_or(json_null());
   if (perf_cmd.isString()) {
     perf_cmd = json_array({perf_cmd});
   }
@@ -201,7 +197,7 @@ void PerfLogThread::loop() noexcept {
     {
       auto state = state_.lock();
       while (true) {
-        if (state->samples) {
+        if (!state->samples.empty()) {
           // We found samples to process
           break;
         }
@@ -212,11 +208,11 @@ void PerfLogThread::loop() noexcept {
         cond_.wait(state.as_lock());
       }
 
-      samples = nullptr;
+      samples.clear();
       std::swap(samples, state->samples);
     }
 
-    if (samples) {
+    if (!samples.empty()) {
       // Hack: Divide by two because this limit includes environment variables
       // and perf_cmd.
       // It's possible to compute this correctly on every platform given the

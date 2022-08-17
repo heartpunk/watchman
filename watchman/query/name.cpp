@@ -72,46 +72,44 @@ class NameExpr : public QueryExpr {
     std::unordered_set<w_string> set;
 
     if (!term.isArray()) {
-      throw QueryParseError("Expected array for '", which, "' term");
+      QueryParseError::throwf("Expected array for '{}' term", which);
     }
 
     if (json_array_size(term) > 3) {
-      throw QueryParseError(
-          "Invalid number of arguments for '", which, "' term");
+      QueryParseError::throwf(
+          "Invalid number of arguments for '{}' term", which);
     }
 
     if (json_array_size(term) == 3) {
       const auto& jscope = term.at(2);
       if (!jscope.isString()) {
-        throw QueryParseError("Argument 3 to '", which, "' must be a string");
+        QueryParseError::throwf("Argument 3 to '{}' must be a string", which);
       }
 
       scope = json_string_value(jscope);
 
       if (strcmp(scope, "basename") && strcmp(scope, "wholename")) {
-        throw QueryParseError(
-            "Invalid scope '", scope, "' for ", which, " expression");
+        QueryParseError::throwf(
+            "Invalid scope '{}' for {} expression", scope, which);
       }
     }
 
     const auto& name = term.at(1);
 
     if (name.isArray()) {
-      uint32_t i;
+      const auto& name_array = name.array();
 
-      for (i = 0; i < json_array_size(name); i++) {
-        if (!json_array_get(name, i).isString()) {
-          throw QueryParseError(
-              "Argument 2 to '",
-              which,
-              "' must be either a string or an array of string");
+      for (const auto& ele : name_array) {
+        if (!ele.isString()) {
+          QueryParseError::throwf(
+              "Argument 2 to '{}' must be either a string or an array of string",
+              which);
         }
       }
 
-      set.reserve(json_array_size(name));
-      for (i = 0; i < json_array_size(name); i++) {
+      set.reserve(name_array.size());
+      for (const auto& jele : name_array) {
         w_string element;
-        const auto& jele = name.at(i);
         auto ele = json_to_w_string(jele);
 
         if (caseSensitive == CaseSensitivity::CaseInSensitive) {
@@ -126,10 +124,9 @@ class NameExpr : public QueryExpr {
     } else if (name.isString()) {
       pattern = json_string_value(name);
     } else {
-      throw QueryParseError(
-          "Argument 2 to '",
-          which,
-          "' must be either a string or an array of string");
+      QueryParseError::throwf(
+          "Argument 2 to '{}' must be either a string or an array of string",
+          which);
     }
 
     auto data = new NameExpr(

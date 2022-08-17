@@ -8,7 +8,6 @@
 import json
 import os
 
-from watchman.integration.lib import WatchmanInstance
 from watchman.integration.lib import WatchmanTestCase
 
 
@@ -18,14 +17,13 @@ class TestInfo(WatchmanTestCase.WatchmanTestCase):
         resp = self.watchmanCommand("get-sockname")
         self.assertEqual(
             resp["sockname"],
-            WatchmanInstance.getSharedInstance().getSockPath().legacy_sockpath(),
+            self.watchmanInstance().getSockPath().legacy_sockpath(),
         )
 
     def test_get_config_empty(self) -> None:
         root = self.mkdtemp()
         self.watchmanCommand("watch", root)
-        resp = self.watchmanCommand("get-config", root)
-        self.assertEqual(resp["config"], {})
+        self.assertEqual(self.get_config(root), {})
 
     def test_get_config(self) -> None:
         config = {"test-key": "test-value"}
@@ -33,5 +31,9 @@ class TestInfo(WatchmanTestCase.WatchmanTestCase):
         with open(os.path.join(root, ".watchmanconfig"), "w") as f:
             json.dump(config, f)
         self.watchmanCommand("watch", root)
+        self.assertEqual(self.get_config(root), config)
+
+    def get_config(self, root):
         resp = self.watchmanCommand("get-config", root)
-        self.assertEqual(resp["config"], config)
+        config = resp["config"]
+        return config

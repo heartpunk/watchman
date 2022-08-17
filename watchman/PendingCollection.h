@@ -11,7 +11,7 @@
 #include <folly/futures/Promise.h>
 #include <chrono>
 #include <condition_variable>
-#include "watchman/OptionSet.h"
+#include "eden/common/utils/OptionSet.h"
 #include "watchman/thirdparty/libart/src/art.h"
 #include "watchman/watchman_string.h"
 
@@ -19,7 +19,7 @@ struct watchman_dir;
 
 namespace watchman {
 
-struct PendingFlags : OptionSet<PendingFlags, uint8_t> {
+struct PendingFlags : facebook::eden::OptionSet<PendingFlags, uint8_t> {
   using OptionSet::OptionSet;
   static const NameTable table;
 };
@@ -74,6 +74,13 @@ constexpr inline auto W_PENDING_CRAWL_ONLY = PendingFlags::raw(8);
  * Cookies will not be considered when this flag is set.
  */
 constexpr inline auto W_PENDING_IS_DESYNCED = PendingFlags::raw(16);
+
+/**
+ * Set when the processPath() is triggered by recursive parallel walk.
+ * processPath() -> statPath() should avoid appending to PendingChanges.
+ * Missing pre_stat can be treated as deletion without extra stat().
+ */
+constexpr inline auto W_PENDING_VIA_PWALK = PendingFlags::raw(32);
 
 /**
  * Represents a change notification from the Watcher.

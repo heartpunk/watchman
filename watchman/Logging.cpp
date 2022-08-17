@@ -10,7 +10,10 @@
 #include <folly/ScopeGuard.h>
 #include <folly/ThreadLocal.h>
 #include <folly/experimental/symbolizer/Symbolizer.h>
+#include <folly/portability/SysTime.h>
 #include <folly/system/ThreadName.h>
+
+#include "watchman/portability/Backtrace.h"
 
 #include <array>
 #include <limits>

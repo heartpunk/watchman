@@ -22,9 +22,7 @@ namespace {
 /* Returns true if the global config root_restrict_files is not defined or if
  * one of the files in root_restrict_files exists, false otherwise. */
 bool root_check_restrict(const char* watch_path) {
-  uint32_t i;
   bool enforcing;
-
   auto root_restrict_files = cfg_compute_root_files(&enforcing);
   if (!root_restrict_files) {
     return true;
@@ -33,10 +31,14 @@ bool root_check_restrict(const char* watch_path) {
     return true;
   }
 
-  for (i = 0; i < json_array_size(root_restrict_files); i++) {
-    auto obj = json_array_get(root_restrict_files, i);
+  if (!root_restrict_files->isArray()) {
+    return false;
+  }
+  auto& arr = root_restrict_files->array();
+
+  for (size_t i = 0; i < arr.size(); i++) {
+    auto& obj = arr[i];
     const char* restrict_file = json_string_value(obj);
-    bool rv;
 
     if (!restrict_file) {
       logf(
@@ -48,7 +50,7 @@ bool root_check_restrict(const char* watch_path) {
     }
 
     auto restrict_path = folly::to<std::string>(watch_path, "/", restrict_file);
-    rv = w_path_exists(restrict_path.c_str());
+    bool rv = w_path_exists(restrict_path.c_str());
     if (rv)
       return true;
   }
@@ -57,7 +59,6 @@ bool root_check_restrict(const char* watch_path) {
 }
 
 static void check_allowed_fs(const char* filename, const w_string& fs_type) {
-  uint32_t i;
   const char* advice = NULL;
 
   // Report this to the log always, as it is helpful in understanding
@@ -71,19 +72,21 @@ static void check_allowed_fs(const char* filename, const w_string& fs_type) {
 
   auto advice_string = cfg_get_json("illegal_fstypes_advice");
   if (advice_string) {
-    advice = json_string_value(advice_string);
+    advice = json_string_value(*advice_string);
   }
   if (!advice) {
     advice = "relocate the dir to an allowed filesystem type";
   }
 
-  if (!illegal_fstypes.isArray()) {
+  if (!illegal_fstypes->isArray()) {
     logf(ERR, "resolve_root: global config illegal_fstypes is not an array\n");
     return;
   }
 
-  for (i = 0; i < json_array_size(illegal_fstypes); i++) {
-    auto obj = json_array_get(illegal_fstypes, i);
+  auto& arr = illegal_fstypes->array();
+
+  for (size_t i = 0; i < arr.size(); i++) {
+    auto& obj = arr[i];
     const char* name = json_string_value(obj);
 
     if (!name) {
@@ -99,26 +102,25 @@ static void check_allowed_fs(const char* filename, const w_string& fs_type) {
       continue;
     }
 
-    throw RootResolveError(
-        "path uses the \"",
-        fs_type.view(),
-        "\" filesystem "
-        "and is disallowed by global config illegal_fstypes: ",
+    RootResolveError::throwf(
+        "path uses the \"{}\" filesystem "
+        "and is disallowed by global config illegal_fstypes: {}",
+        fs_type,
         advice);
   }
 }
 
-json_ref load_root_config(const char* path) {
+std::optional<json_ref> load_root_config(const char* path) {
   char cfgfilename[WATCHMAN_NAME_MAX];
   snprintf(cfgfilename, sizeof(cfgfilename), "%s/.watchmanconfig", path);
 
   if (!w_path_exists(cfgfilename)) {
     if (errno == ENOENT) {
-      return nullptr;
+      return std::nullopt;
     }
     logf(
         ERR, "{} is not accessible: {}\n", cfgfilename, folly::errnoStr(errno));
-    return nullptr;
+    return std::nullopt;
   }
 
   return json_load_file(cfgfilename, 0);
@@ -136,7 +138,7 @@ root_resolve(const char* filename, bool auto_watch, bool* created) {
   // Sanity check that the path is absolute
   if (!w_is_path_absolute_cstr(filename)) {
     log(ERR, "resolve_root: path \"", filename, "\" must be absolute\n");
-    throw RootResolveError("path \"", filename, "\" must be absolute");
+    RootResolveError::throwf("path \"{}\" must be absolute", filename);
   }
 
   if (!strcmp(filename, "/")) {
@@ -152,23 +154,20 @@ root_resolve(const char* filename, bool auto_watch, bool* created) {
       getFileInformation(filename);
     } catch (const std::system_error& exc) {
       if (exc.code() == error_code::no_such_file_or_directory) {
-        throw RootResolveError(
-            "\"",
-            filename,
-            "\" resolved to \"",
-            root_str.view(),
-            "\" but we were "
-            "unable to examine \"",
-            filename,
-            "\" using strict "
+        RootResolveError::throwf(
+            "\"{}\" resolved to \"{}\" but we were "
+            "unable to examine \"{}\" using strict "
             "case sensitive rules.  Please check "
             "each component of the path and make "
             "sure that that path exactly matches "
             "the correct case of the files on your "
-            "filesystem.");
+            "filesystem.",
+            filename,
+            root_str,
+            filename);
       }
-      throw RootResolveError(
-          "unable to lstat \"", filename, "\" %s", exc.what());
+      RootResolveError::throwf(
+          "unable to lstat \"{}\" {}", filename, exc.what());
     }
   } catch (const std::system_error& exc) {
     realpath_err = exc.code();
@@ -185,13 +184,13 @@ root_resolve(const char* filename, bool auto_watch, bool* created) {
 
   if (!root && realpath_err.value() != 0) {
     // Path didn't resolve and neither did the name they passed in
-    throw RootResolveError(
-        "realpath(", filename, ") -> ", realpath_err.message());
+    RootResolveError::throwf(
+        "realpath({}) -> {}", filename, realpath_err.message());
   }
 
   if (root || !auto_watch) {
     if (!root) {
-      throw RootResolveError("directory ", root_str.view(), " is not watched");
+      RootResolveError::throwf("directory {} is not watched", root_str);
     }
 
     // Treat this as new activity for aging purposes; this roughly maps
@@ -216,22 +215,19 @@ root_resolve(const char* filename, bool auto_watch, bool* created) {
   if (!root_check_restrict(root_str.c_str())) {
     bool enforcing;
     auto root_files = cfg_compute_root_files(&enforcing);
-    auto root_files_list = cfg_pretty_print_root_files(root_files);
-    throw RootResolveError(
+    auto root_files_list = cfg_pretty_print_root_files(root_files.value());
+    RootResolveError::throwf(
         "Your watchman administrator has configured watchman "
-        "to prevent watching path `",
-        root_str.view(),
-        "`.  None of the files "
+        "to prevent watching path `{}`.  None of the files "
         "listed in global config root_files are "
         "present and enforce_root_files is set to true.  "
-        "root_files is defined by the `",
-        cfg_get_global_config_file_path().view(),
-        "` config file and "
-        "includes ",
-        root_files_list,
-        ".  One or more of these files must be "
+        "root_files is defined by the `{}` config file and "
+        "includes {}.  One or more of these files must be "
         "present in order to allow a watch.  Try pulling "
-        "and checking out a newer version of the project?");
+        "and checking out a newer version of the project?",
+        root_str,
+        cfg_get_global_config_file_path(),
+        root_files_list);
   }
 
   auto config_file = load_root_config(root_str.c_str());

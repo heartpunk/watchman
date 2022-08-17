@@ -82,7 +82,7 @@ class TypeExpr : public QueryExpr {
     char arg;
 
     if (!term.isArray()) {
-      throw QueryParseError("\"type\" term requires a type string parameter");
+      throw QueryParseError{"\"type\" term requires a type string parameter"};
     }
 
     if (term.array().size() > 1 && term.at(1).isString()) {
@@ -94,7 +94,7 @@ class TypeExpr : public QueryExpr {
 
     found = strpbrk(typestr, "bcdfplsD");
     if (!found || strlen(typestr) > 1) {
-      throw QueryParseError("invalid type string '", typestr, "'");
+      QueryParseError::throwf("invalid type string '{}'", typestr);
     }
 
     arg = *found;

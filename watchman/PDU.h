@@ -8,11 +8,14 @@
 #pragma once
 
 #include <stdint.h>
+#include "watchman/Result.h"
 #include "watchman/thirdparty/jansson/jansson.h"
 
-class watchman_stream;
+namespace watchman {
 
-enum w_pdu_type {
+class Stream;
+
+enum PduType : uint32_t {
   need_data,
   is_json_compact,
   is_json_pretty,
@@ -20,60 +23,68 @@ enum w_pdu_type {
   is_bser_v2
 };
 
-struct watchman_json_buffer {
-  char* buf;
-  uint32_t allocd;
-  uint32_t rpos, wpos;
-  w_pdu_type pdu_type;
-  uint32_t capabilities;
+/**
+ * Specifies the wire encoding of a Watchman request or response.
+ *
+ * This could be made to fit in 8 bits, but it doesn't matter.
+ */
+struct PduFormat {
+  PduType type = need_data;
+  /// Capability bits only used for BSER v2, defined in bser.h
+  uint32_t capabilities = 0;
+};
 
-  ~watchman_json_buffer();
-  watchman_json_buffer();
-  watchman_json_buffer(const watchman_json_buffer&) = delete;
-  watchman_json_buffer& operator=(const watchman_json_buffer&) = delete;
+class PduBuffer {
+ public:
+  char* buf;
+  uint32_t allocd = 0;
+  uint32_t rpos = 0;
+  uint32_t wpos = 0;
+
+  /// The encoding format detected by decodeNext
+  PduFormat format;
+
+  PduBuffer();
+  PduBuffer(const PduBuffer&) = delete;
+  PduBuffer(PduBuffer&&) = delete;
+  PduBuffer& operator=(const PduBuffer&) = delete;
+  PduBuffer& operator=(const PduBuffer&&) = delete;
+  ~PduBuffer();
 
   void clear();
-  bool
-  jsonEncodeToStream(const json_ref& json, watchman_stream* stm, int flags);
-  bool bserEncodeToStream(
+  ResultErrno<folly::Unit>
+  jsonEncodeToStream(const json_ref& json, Stream* stm, int flags);
+  ResultErrno<folly::Unit> bserEncodeToStream(
       uint32_t bser_version,
       uint32_t bser_capabilities,
       const json_ref& json,
-      watchman_stream* stm);
+      Stream* stm);
 
-  bool pduEncodeToStream(
-      w_pdu_type pdu_type,
-      uint32_t capabilities,
-      const json_ref& json,
-      watchman_stream* stm);
+  ResultErrno<folly::Unit>
+  pduEncodeToStream(PduFormat format, const json_ref& json, Stream* stm);
 
-  json_ref decodeNext(watchman_stream* stm, json_error_t* jerr);
+  std::optional<json_ref> decodeNext(Stream* stm, json_error_t* jerr);
 
-  bool passThru(
-      w_pdu_type output_pdu,
-      uint32_t output_capabilities,
-      watchman_json_buffer* output_pdu_buf,
-      watchman_stream* stm);
+  bool readAndDetectPdu(Stream* stm, json_error_t* jerr);
+  std::optional<json_ref> decodePdu(Stream* stm, json_error_t* jerr);
+  bool streamPdu(Stream* stm, json_error_t* jerr);
 
  private:
-  bool readAndDetectPdu(watchman_stream* stm, json_error_t* jerr);
-  inline uint32_t shuntDown();
-  bool fillBuffer(watchman_stream* stm);
-  inline w_pdu_type detectPdu();
-  json_ref readJsonPrettyPdu(watchman_stream* stm, json_error_t* jerr);
-  json_ref readJsonPdu(watchman_stream* stm, json_error_t* jerr);
-  json_ref
-  readBserPdu(watchman_stream* stm, uint32_t bser_version, json_error_t* jerr);
-  json_ref decodePdu(watchman_stream* stm, json_error_t* jerr);
+  uint32_t shuntDown();
+  bool fillBuffer(Stream* stm);
+  PduType detectPdu();
+  std::optional<json_ref> readJsonPrettyPdu(Stream* stm, json_error_t* jerr);
+  std::optional<json_ref> readJsonPdu(Stream* stm, json_error_t* jerr);
+  std::optional<json_ref>
+  readBserPdu(Stream* stm, uint32_t bser_version, json_error_t* jerr);
   bool decodePduInfo(
-      watchman_stream* stm,
+      Stream* stm,
       uint32_t bser_version,
       json_int_t* len,
       json_int_t* bser_capabilities,
       json_error_t* jerr);
-  bool streamPdu(watchman_stream* stm, json_error_t* jerr);
-  bool streamUntilNewLine(watchman_stream* stm);
-  bool streamN(watchman_stream* stm, json_int_t len, json_error_t* jerr);
+  bool streamUntilNewLine(Stream* stm);
+  bool streamN(Stream* stm, json_int_t len, json_error_t* jerr);
 };
 
-typedef struct watchman_json_buffer w_jbuffer_t;
+} // namespace watchman

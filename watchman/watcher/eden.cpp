@@ -24,9 +24,11 @@
 #include "eden/fs/service/gen-cpp2/StreamingEdenService.h"
 #include "watchman/ChildProcess.h"
 #include "watchman/Errors.h"
+#include "watchman/LRUCache.h"
 #include "watchman/QueryableView.h"
 #include "watchman/ThreadPool.h"
 #include "watchman/fs/FSDetect.h"
+#include "watchman/fs/FileDescriptor.h"
 #include "watchman/query/GlobTree.h"
 #include "watchman/query/Query.h"
 #include "watchman/query/QueryContext.h"
@@ -38,18 +40,7 @@
 #include "watchman/watcher/WatcherRegistry.h"
 
 using apache::thrift::TApplicationException;
-using facebook::eden::EdenError;
-using facebook::eden::EntryInformation;
-using facebook::eden::EntryInformationOrError;
-using facebook::eden::FileDelta;
-using facebook::eden::FileInformation;
-using facebook::eden::FileInformationOrError;
-using facebook::eden::Glob;
-using facebook::eden::GlobParams;
-using facebook::eden::JournalPosition;
-using facebook::eden::SHA1Result;
-using facebook::eden::StreamingEdenServiceAsyncClient;
-using facebook::eden::SyncBehavior;
+using namespace facebook::eden;
 using folly::AsyncSocket;
 using folly::to;
 using std::make_unique;
@@ -174,19 +165,38 @@ std::unique_ptr<StreamingEdenServiceAsyncClient> getEdenClient(
   return make_unique<StreamingEdenServiceAsyncClient>(std::move(channel));
 }
 
-/** Create a thrift client that will connect to the eden server associated
- * with the current user.
- * This particular client uses the RocketClientChannel channel that
- * is required to use the new thrift streaming protocol. */
-std::unique_ptr<StreamingEdenServiceAsyncClient> getRocketEdenClient(
-    w_string_piece rootPath,
-    folly::EventBase* eb = folly::EventBaseManager::get()->getEventBase()) {
-  auto addr = getEdenSocketAddress(rootPath);
+class GetJournalPositionCallback : public folly::HHWheelTimer::Callback {
+ public:
+  GetJournalPositionCallback(
+      folly::EventBase* eventBase,
+      std::shared_ptr<apache::thrift::RequestChannel> thriftChannel,
+      std::string mountPoint)
+      : eventBase_{eventBase},
+        thriftChannel_{std::move(thriftChannel)},
+        mountPoint_{std::move(mountPoint)} {}
 
-  return make_unique<StreamingEdenServiceAsyncClient>(
-      apache::thrift::RocketClientChannel::newChannel(
-          AsyncSocket::UniquePtr(new AsyncSocket(eb, addr))));
-}
+  void timeoutExpired() noexcept override {
+    try {
+      auto edenClient = getEdenClient(thriftChannel_);
+
+      // Calling getCurrentJournalPosition will allow EdenFS to send new
+      // notification about files changed.
+      JournalPosition journal;
+      edenClient->sync_getCurrentJournalPosition(journal, mountPoint_);
+    } catch (const std::exception& exc) {
+      log(ERR,
+          "error while getting EdenFS's journal position; cancel watch: ",
+          exc.what(),
+          "\n");
+      eventBase_->terminateLoopSoon();
+    }
+  }
+
+ private:
+  folly::EventBase* eventBase_;
+  std::shared_ptr<apache::thrift::RequestChannel> thriftChannel_;
+  std::string mountPoint_;
+};
 
 class EdenFileResult : public FileResult {
  public:
@@ -194,7 +204,7 @@ class EdenFileResult : public FileResult {
       const w_string& rootPath,
       std::shared_ptr<apache::thrift::RequestChannel> thriftChannel,
       const w_string& fullName,
-      JournalPosition* position = nullptr,
+      ClockTicks* ticks = nullptr,
       bool isNew = false,
       DType dtype = DType::Unknown)
       : rootPath_(rootPath),
@@ -203,8 +213,8 @@ class EdenFileResult : public FileResult {
         dtype_(dtype) {
     otime_.ticks = ctime_.ticks = 0;
     otime_.timestamp = ctime_.timestamp = 0;
-    if (position) {
-      otime_.ticks = *position->sequenceNumber();
+    if (ticks) {
+      otime_.ticks = *ticks;
       if (isNew) {
         // the "ctime" in the context of FileResult represents the point
         // in time that we saw the file transition !exists -> exists.
@@ -337,9 +347,9 @@ class EdenFileResult : public FileResult {
       // Thrift error occured
       case SHA1Result::Type::error: {
         auto& err = sha1_->get_error();
-        XCHECK(err.errorCode_ref());
+        XCHECK(err.errorCode());
         throw std::system_error(
-            *err.errorCode_ref(), std::generic_category(), *err.message_ref());
+            *err.errorCode(), std::generic_category(), *err.message());
       }
 
       // Something is wrong with type union
@@ -604,58 +614,6 @@ void filterOutPaths(std::vector<NameAndDType>& files, QueryContext* ctx) {
       files.end());
 }
 
-/** Wraps around the raw SCM to acclerate certain things for Eden
- */
-class EdenWrappedSCM : public SCM {
-  std::unique_ptr<SCM> inner_;
-  std::string mountPoint_;
-
- public:
-  explicit EdenWrappedSCM(std::unique_ptr<SCM> inner)
-      : SCM(inner->getRootPath(), inner->getSCMRoot()),
-        inner_(std::move(inner)),
-        mountPoint_(std::string{getRootPath().view()}) {}
-
-  w_string mergeBaseWith(w_string_piece commitId, w_string requestId = nullptr)
-      const override {
-    return inner_->mergeBaseWith(commitId, requestId);
-  }
-  std::vector<w_string> getFilesChangedSinceMergeBaseWith(
-      w_string_piece commitId,
-      w_string requestId = nullptr) const override {
-    return inner_->getFilesChangedSinceMergeBaseWith(commitId, requestId);
-  }
-
-  SCM::StatusResult getFilesChangedBetweenCommits(
-      std::vector<std::string> commits,
-      w_string requestId,
-      bool includeDirectories) const override {
-    return inner_->getFilesChangedBetweenCommits(
-        std::move(commits), requestId, includeDirectories);
-  }
-
-  std::chrono::time_point<std::chrono::system_clock> getCommitDate(
-      w_string_piece commitId,
-      w_string requestId = nullptr) const override {
-    return inner_->getCommitDate(commitId, requestId);
-  }
-
-  std::vector<w_string> getCommitsPriorToAndIncluding(
-      w_string_piece commitId,
-      int numCommits,
-      w_string requestId = nullptr) const override {
-    return inner_->getCommitsPriorToAndIncluding(
-        commitId, numCommits, requestId);
-  }
-
-  static std::unique_ptr<EdenWrappedSCM> wrap(std::unique_ptr<SCM> inner) {
-    if (!inner) {
-      return nullptr;
-    }
-    return make_unique<EdenWrappedSCM>(std::move(inner));
-  }
-};
-
 void appendGlobResultToNameAndDTypeVec(
     std::vector<NameAndDType>& results,
     Glob&& glob) {
@@ -740,7 +698,7 @@ std::shared_ptr<apache::thrift::RequestChannel> makeThriftChannel(
             numRetries,
             apache::thrift::ReconnectingRequestChannel::newChannel(
                 eb, [rootPath](folly::EventBase& eb) {
-                  return apache::thrift::HeaderClientChannel::newChannel(
+                  return apache::thrift::RocketClientChannel::newChannel(
                       AsyncSocket::newSocket(
                           &eb, getEdenSocketAddress(rootPath)));
                 }));
@@ -751,239 +709,44 @@ std::shared_ptr<apache::thrift::RequestChannel> makeThriftChannel(
 } // namespace
 
 class EdenView final : public QueryableView {
-  w_string rootPath_;
-  std::shared_ptr<apache::thrift::RequestChannel> thriftChannel_;
-  // The source control system that we detected during initialization
-  mutable std::unique_ptr<EdenWrappedSCM> scm_;
-  folly::EventBase subscriberEventBase_;
-  JournalPosition lastCookiePosition_;
-  std::string mountPoint_;
-  folly::SharedPromise<folly::Unit> subscribeReadyPromise_;
-  bool splitGlobPattern_;
-
  public:
   explicit EdenView(const w_string& root_path, const Configuration& config)
-      : QueryableView{/*requiresCrawl=*/false},
+      : QueryableView{root_path, /*requiresCrawl=*/false},
         rootPath_(root_path),
         thriftChannel_(makeThriftChannel(
             rootPath_,
             config.getInt("eden_retry_connection_count", 3))),
-        scm_(EdenWrappedSCM::wrap(SCM::scmForPath(root_path))),
         mountPoint_(root_path.string()),
-        splitGlobPattern_(config.getBool("eden_split_glob_pattern", false)) {
-    // Get the current journal position so that we can keep track of
-    // cookie file changes
-    auto client = getEdenClient(thriftChannel_);
-    client->sync_getCurrentJournalPosition(lastCookiePosition_, mountPoint_);
-  }
+        splitGlobPattern_(config.getBool("eden_split_glob_pattern", false)),
+        useStreamingSince_(config.getBool("eden_use_streaming_since", false)),
+        thresholdForFreshInstance_(config.getInt(
+            "eden_file_count_threshold_for_fresh_instance",
+            10000)),
+        filesChangedBetweenCommits_(
+            Configuration(),
+            "scm_hg_files_between_commits",
+            32,
+            10) {}
 
-  void timeGenerator(const Query* query, QueryContext* ctx) const override {
+  void timeGenerator(const Query* /*query*/, QueryContext* ctx) const override {
     ctx->generationStarted();
-    auto client = getEdenClient(thriftChannel_);
-
-    FileDelta delta;
-    JournalPosition resultPosition;
 
     if (ctx->since.is_timestamp()) {
       throw QueryExecError(
           "timestamp based since queries are not supported with eden");
     }
 
-    // This is the fall back for a fresh instance result set.
-    // There are two different code paths that may need this, so
-    // it is broken out as a lambda.
-    auto getAllFiles = [this,
-                        ctx,
-                        &client,
-                        includeDotfiles =
-                            (query->glob_flags & WM_PERIOD) == 0]() {
-      if (ctx->query->empty_on_fresh_instance) {
-        // Avoid a full tree walk if we don't need it!
-        return std::vector<NameAndDType>();
-      }
-
-      std::string globPattern;
-      if (ctx->query->relative_root) {
-        w_string_piece rel(ctx->query->relative_root);
-        rel.advance(ctx->root->root_path.size() + 1);
-        globPattern.append(rel.data(), rel.size());
-        globPattern.append("/");
-      }
-      globPattern.append("**");
-      return globNameAndDType(
-          client.get(),
-          mountPoint_,
-          std::vector<std::string>{globPattern},
-          includeDotfiles);
-    };
-
-    std::vector<NameAndDType> fileInfo;
+    auto allFilesResult = getAllChangesSince(ctx);
+    auto resultTicks = allFilesResult.ticks;
+    auto& fileInfo = allFilesResult.fileInfo;
     // We use the list of created files to synthesize the "new" field
     // in the file results
-    std::unordered_set<std::string> createdFileNames;
-
-    // The code that was previously here was UB if given a timestamp since.
-    // Instead, at least throw an exception at this point.
-    auto& since_clock = std::get<QuerySince::Clock>(ctx->since.since);
-
-    if (since_clock.is_fresh_instance) {
-      // Earlier in the processing flow, we decided that the rootNumber
-      // didn't match the current root which means that eden was restarted.
-      // We need to translate this to a fresh instance result set and
-      // return a list of all possible matching files.
-      client->sync_getCurrentJournalPosition(resultPosition, mountPoint_);
-      fileInfo = getAllFiles();
-    } else {
-      // Query eden to fill in the mountGeneration field.
-      JournalPosition position;
-      client->sync_getCurrentJournalPosition(position, mountPoint_);
-      // dial back to the sequence number from the query
-      *position.sequenceNumber() = since_clock.ticks;
-
-      // Now we can get the change journal from eden
-      try {
-        client->sync_getFilesChangedSince(delta, mountPoint_, position);
-
-        createdFileNames.insert(
-            delta.createdPaths()->begin(), delta.createdPaths()->end());
-
-        // The list of changed files is the union of the created, added,
-        // and removed sets returned from eden in list form.
-        for (auto& name : *delta.changedPaths()) {
-          fileInfo.emplace_back(NameAndDType(std::move(name)));
-        }
-        for (auto& name : *delta.removedPaths()) {
-          fileInfo.emplace_back(NameAndDType(std::move(name)));
-        }
-        for (auto& name : *delta.createdPaths()) {
-          fileInfo.emplace_back(NameAndDType(std::move(name)));
-        }
-
-        bool didChangeCommits = delta.snapshotTransitions()->size() >= 2 ||
-            (delta.fromPosition()->snapshotHash() !=
-             delta.toPosition()->snapshotHash());
-
-        if (scm_ && didChangeCommits) {
-          // Check whether they checked out a new commit or reset the commit to
-          // a different hash.  We interrogate source control to discover
-          // the set of changed files between those hashes, and then
-          // add in any paths that may have changed around snapshot hash
-          // changes events;  These are files whose status cannot be
-          // determined purely from source control operations.
-
-          std::unordered_set<std::string> mergedFileList;
-          for (auto& info : fileInfo) {
-            mergedFileList.insert(info.name);
-          }
-
-          SCM::StatusResult changedBetweenCommits;
-          if (delta.snapshotTransitions()->empty()) {
-            auto fromHash =
-                folly::hexlify(*delta.fromPosition()->snapshotHash());
-            auto toHash = folly::hexlify(*delta.toPosition()->snapshotHash());
-
-            // Legacy path: this (incorrectly) ignores any commit transitions
-            // between the initial commit hash and the final commit hash.
-            log(ERR,
-                "since ",
-                *position.sequenceNumber(),
-                " we changed commit hashes from ",
-                fromHash,
-                " to ",
-                toHash,
-                "\n");
-
-            std::vector<std::string> commits{
-                std::move(fromHash), std::move(toHash)};
-            changedBetweenCommits = getSCM()->getFilesChangedBetweenCommits(
-                std::move(commits),
-                /*requestId*/ nullptr,
-                ctx->query->alwaysIncludeDirectories);
-          } else if (delta.snapshotTransitions()->size() >= 2) {
-            std::vector<std::string> commits;
-            commits.reserve(delta.snapshotTransitions()->size());
-            for (auto& hash : *delta.snapshotTransitions()) {
-              commits.push_back(folly::hexlify(hash));
-            }
-            log(ERR,
-                "since ",
-                *position.sequenceNumber(),
-                " we changed commit hashes ",
-                folly::join(" -> ", commits),
-                "\n");
-            changedBetweenCommits = getSCM()->getFilesChangedBetweenCommits(
-                std::move(commits),
-                /*requestId*/ nullptr,
-                ctx->query->alwaysIncludeDirectories);
-          }
-
-          for (auto& fileName : changedBetweenCommits.changedFiles) {
-            mergedFileList.insert(std::string{fileName.view()});
-          }
-          for (auto& fileName : changedBetweenCommits.removedFiles) {
-            mergedFileList.insert(std::string{fileName.view()});
-          }
-          for (auto& fileName : changedBetweenCommits.addedFiles) {
-            mergedFileList.insert(std::string{fileName.view()});
-            createdFileNames.insert(std::string{fileName.view()});
-          }
-
-          // We don't know whether the unclean paths are added, removed
-          // or just changed.  We're going to treat them as changed.
-          mergedFileList.insert(
-              std::make_move_iterator(delta.uncleanPaths()->begin()),
-              std::make_move_iterator(delta.uncleanPaths()->end()));
-
-          // Replace the list of fileNames with the de-duped set
-          // of names we've extracted from source control
-          fileInfo.clear();
-          for (auto name : mergedFileList) {
-            fileInfo.emplace_back(std::move(name));
-          }
-        }
-
-        resultPosition = *delta.toPosition();
-        log(DBG,
-            "wanted from ",
-            *position.sequenceNumber(),
-            " result delta from ",
-            *delta.fromPosition()->sequenceNumber(),
-            " to ",
-            *delta.toPosition()->sequenceNumber(),
-            " with ",
-            fileInfo.size(),
-            " changed files\n");
-      } catch (const EdenError& err) {
-        // ERANGE: mountGeneration differs
-        // EDOM: journal was truncated.
-        // For other situations we let the error propagate.
-        XCHECK(err.errorCode_ref());
-        if (*err.errorCode_ref() != ERANGE && *err.errorCode_ref() != EDOM) {
-          throw;
-        }
-        // mountGeneration differs, or journal was truncated,
-        // so treat this as equivalent to a fresh instance result
-        since_clock.is_fresh_instance = true;
-        client->sync_getCurrentJournalPosition(resultPosition, mountPoint_);
-        fileInfo = getAllFiles();
-      } catch (const SCMError& err) {
-        // Most likely this means a checkout occurred but we encountered
-        // an error trying to get the list of files changed between the two
-        // commits.  Generate a fresh instance result since we were unable
-        // to compute the list of files changed.
-        log(ERR,
-            "SCM error while processing EdenFS journal update: ",
-            err.what(),
-            "\n");
-        since_clock.is_fresh_instance = true;
-        client->sync_getCurrentJournalPosition(resultPosition, mountPoint_);
-        fileInfo = getAllFiles();
-      }
-    }
+    auto& createdFileNames = allFilesResult.createdFileNames;
 
     // Filter out any ignored files
     filterOutPaths(fileInfo, ctx);
 
+    auto isFreshInstance = ctx->since.is_fresh_instance();
     for (auto& item : fileInfo) {
       // a file is considered new if it was present in the created files
       // set returned from eden.
@@ -993,11 +756,11 @@ class EdenView final : public QueryableView {
           rootPath_,
           thriftChannel_,
           w_string::pathCat({mountPoint_, item.name}),
-          &resultPosition,
+          &resultTicks,
           isNew,
           item.dtype);
 
-      if (since_clock.is_fresh_instance) {
+      if (isFreshInstance) {
         // Fresh instance queries only return data about files
         // that currently exist, and we know this to be true
         // here because our list of files comes from evaluating
@@ -1020,24 +783,44 @@ class EdenView final : public QueryableView {
   }
 
   CookieSync::SyncResult syncToNow(
-      const std::shared_ptr<Root>&,
+      const std::shared_ptr<Root>& root,
       std::chrono::milliseconds timeout) override {
-    auto client = getEdenClient(thriftChannel_);
     try {
-      client
-          ->semifuture_synchronizeWorkingCopy(
-              mountPoint_, facebook::eden::SynchronizeWorkingCopyParams{})
-          .get(timeout);
+      return sync(root).get(timeout);
     } catch (const folly::FutureTimeout& ex) {
       throw std::system_error(ETIMEDOUT, std::generic_category(), ex.what());
-    } catch (const TApplicationException& ex) {
-      if (ex.getType() != TApplicationException::UNKNOWN_METHOD) {
-        throw;
-      }
-
-      // On older EdenFS version, no synchronization is needed.
     }
     return {};
+  }
+
+  folly::SemiFuture<CookieSync::SyncResult> sync(
+      const std::shared_ptr<Root>&) override {
+    return folly::makeSemiFutureWith([this]() {
+             // Set an unlimited timeout. The caller is responsible for using a
+             // timeout to bound the time spent in this method.
+             facebook::eden::SyncBehavior sync;
+             sync.syncTimeoutSeconds() = -1;
+
+             facebook::eden::SynchronizeWorkingCopyParams params;
+             params.sync() = sync;
+
+             auto client = getEdenClient(thriftChannel_);
+             return client->semifuture_synchronizeWorkingCopy(
+                 mountPoint_, params);
+           })
+        .defer([](folly::Try<folly::Unit> try_) {
+          if (try_.hasException()) {
+            if (auto* exc =
+                    try_.tryGetExceptionObject<TApplicationException>()) {
+              if (exc->getType() == TApplicationException::UNKNOWN_METHOD) {
+                return folly::Try{CookieSync::SyncResult{}};
+              }
+            }
+            return folly::Try<CookieSync::SyncResult>{
+                std::move(try_.exception())};
+          }
+          return folly::Try{CookieSync::SyncResult{}};
+        });
   }
 
   void executeGlobBasedQuery(
@@ -1063,7 +846,7 @@ class EdenView final : public QueryableView {
           rootPath_,
           thriftChannel_,
           w_string::pathCat({mountPoint_, item.name}),
-          /* position=*/nullptr,
+          /*ticks=*/nullptr,
           /*isNew=*/false,
           item.dtype);
 
@@ -1192,10 +975,6 @@ class EdenView final : public QueryableView {
     return false;
   }
 
-  SCM* getSCM() const override {
-    return scm_.get();
-  }
-
   void startThreads(const std::shared_ptr<Root>& root) override {
     auto self = shared_from_this();
     std::thread thr([self, this, root]() { subscriberThread(root); });
@@ -1212,93 +991,63 @@ class EdenView final : public QueryableView {
 
   void clearWatcherDebugInfo() override {}
 
-  // Called by the subscriberThread to scan for cookie file creation
-  // events.  These are used to manage sequencing for state-enter and
-  // state-leave in eden.
-  void checkCookies(const std::shared_ptr<Root>& root) {
-    // Obtain the list of changes since our last request, or since we started
-    // up the watcher (we set the initial value of lastCookiePosition_ during
-    // construction).
-    try {
-      FileDelta delta;
-      auto client = getEdenClient(thriftChannel_);
-      client->sync_getFilesChangedSince(
-          delta, mountPoint_, lastCookiePosition_);
+  using EdenFSSubcription =
+      apache::thrift::ClientBufferedStream<JournalPosition>::Subscription;
 
-      // TODO: in the future it would be nice to compute the paths in a loop
-      // first, and then add a bulk CookieSync::notifyCookies() method to avoid
-      // locking and unlocking its internal mutex so frequently.
-      for (auto& file : *delta.createdPaths()) {
-        auto full = w_string::pathCat({rootPath_, file});
-        root->cookies.notifyCookie(full);
-      }
-
-      // Remember this position for subsequent calls
-      lastCookiePosition_ = *delta.toPosition();
-    } catch (const EdenError& err) {
-      // EDOM is journal truncation, which we can recover from.
-      // Other errors (including ERANGE/mountGeneration changed)
-      // are not recoverable, so let them propagate.
-      XCHECK(err.errorCode_ref());
-      if (*err.errorCode_ref() != EDOM) {
-        throw;
-      }
-      // Journal was truncated: we can remain connected and have continuity
-      // with the Journal sequence numbers, but we may have missed cookie
-      // file events, so let's abort all currently outstanding cookies. The
-      // cookie sync mechanism will retry if there is sufficient time remaining
-      // in their individual retry schedule(s).
-      root->cookies.abortAllCookies();
-    }
-  }
-
-  std::unique_ptr<StreamingEdenServiceAsyncClient> rocketSubscribe(
+  EdenFSSubcription rocketSubscribe(
       std::shared_ptr<Root> root,
       SettleCallback& settleCallback,
-      std::chrono::milliseconds& settleTimeout) {
-    auto client = getRocketEdenClient(root->root_path, &subscriberEventBase_);
+      GetJournalPositionCallback& getJournalPositionCallback,
+      std::chrono::milliseconds settleTimeout) {
+    auto client = getEdenClient(thriftChannel_);
     auto stream = client->sync_subscribeStreamTemporary(
         std::string(root->root_path.data(), root->root_path.size()));
-    std::move(stream)
-        .subscribeExTry(
-            &subscriberEventBase_,
-            [&settleCallback, this, root, settleTimeout](
-                folly::Try<JournalPosition>&& t) {
-              if (t.hasValue()) {
-                try {
-                  log(DBG, "Got subscription push from eden\n");
-                  if (settleCallback.isScheduled()) {
-                    log(DBG, "reschedule settle timeout\n");
-                    settleCallback.cancelTimeout();
-                  }
-                  subscriberEventBase_.timer().scheduleTimeout(
-                      &settleCallback, settleTimeout);
-
-                  // We need to process cookie files with the lowest
-                  // possible latency, so we consume that information now
-                  checkCookies(root);
-                } catch (const std::exception& exc) {
-                  log(ERR,
-                      "Exception while processing eden subscription: ",
-                      exc.what(),
-                      ": cancel watch\n");
-                  subscriberEventBase_.terminateLoopSoon();
-                }
-              } else {
-                auto reason = t.hasException()
-                    ? folly::exceptionStr(std::move(t.exception()))
-                    : "controlled shutdown";
-                log(ERR,
-                    "subscription stream ended: ",
-                    w_string_piece(reason.data(), reason.size()),
-                    ", cancel watch\n");
-                // We won't be called again, but we terminate the loop
-                // just to make sure.
-                subscriberEventBase_.terminateLoopSoon();
+    return std::move(stream).subscribeExTry(
+        &subscriberEventBase_,
+        [&settleCallback,
+         &getJournalPositionCallback,
+         this,
+         root,
+         settleTimeout](folly::Try<JournalPosition>&& t) {
+          if (t.hasValue()) {
+            try {
+              log(DBG, "Got subscription push from eden\n");
+              if (settleCallback.isScheduled()) {
+                log(DBG, "reschedule settle timeout\n");
+                settleCallback.cancelTimeout();
               }
-            })
-        .detach();
-    return client;
+              subscriberEventBase_.timer().scheduleTimeout(
+                  &settleCallback, settleTimeout);
+
+              // For bursty writes to the working copy, let's limit the
+              // amount of notification that Watchman receives by
+              // scheduling a getCurrentJournalPosition call in the future.
+              //
+              // Thus, we're guarantee to only receive one notification per
+              // settleTimeout/2 and no more, regardless of how much
+              // writing is done in the repository.
+              subscriberEventBase_.timer().scheduleTimeout(
+                  &getJournalPositionCallback, settleTimeout / 2);
+            } catch (const std::exception& exc) {
+              log(ERR,
+                  "Exception while processing eden subscription: ",
+                  exc.what(),
+                  ": cancel watch\n");
+              subscriberEventBase_.terminateLoopSoon();
+            }
+          } else {
+            auto reason = t.hasException()
+                ? folly::exceptionStr(std::move(t.exception()))
+                : "controlled shutdown";
+            log(ERR,
+                "subscription stream ended: ",
+                w_string_piece(reason.data(), reason.size()),
+                ", cancel watch\n");
+            // We won't be called again, but we terminate the loop
+            // just to make sure.
+            subscriberEventBase_.terminateLoopSoon();
+          }
+        });
   }
 
   // This is the thread that we use to listen to the stream of
@@ -1313,14 +1062,24 @@ class EdenView final : public QueryableView {
     w_set_thread_name("edensub ", root->root_path.view());
     log(DBG, "Started subscription thread\n");
 
+    std::optional<EdenFSSubcription> subscription;
+    SCOPE_EXIT {
+      if (subscription.has_value()) {
+        subscription->cancel();
+        std::move(*subscription).join();
+      }
+    };
+
     try {
       // Prepare the callback
-      SettleCallback settleCallback(&subscriberEventBase_, root);
+      SettleCallback settleCallback{&subscriberEventBase_, root};
+      GetJournalPositionCallback getJournalPositionCallback{
+          &subscriberEventBase_, thriftChannel_, mountPoint_};
       // Figure out the correct value for settling
       std::chrono::milliseconds settleTimeout(root->trigger_settle);
-      std::unique_ptr<StreamingEdenServiceAsyncClient> client;
 
-      client = rocketSubscribe(root, settleCallback, settleTimeout);
+      subscription = rocketSubscribe(
+          root, settleCallback, getJournalPositionCallback, settleTimeout);
 
       // This will run until the stream ends
       log(DBG, "Started subscription thread loop\n");
@@ -1343,6 +1102,466 @@ class EdenView final : public QueryableView {
   folly::SemiFuture<folly::Unit> waitUntilReadyToQuery() override {
     return subscribeReadyPromise_.getSemiFuture();
   }
+
+ private:
+  /**
+   * Returns all the files in the watched directory for a fresh instance.
+   *
+   * In the case where the query specifically ask for an empty file list on a
+   * fresh instance, an empty vector will be returned.
+   */
+  std::vector<NameAndDType> getAllFilesForFreshInstance(
+      QueryContext* ctx) const {
+    if (ctx->query->empty_on_fresh_instance) {
+      // Avoid a full tree walk if we don't need it!
+      return std::vector<NameAndDType>();
+    }
+
+    std::string globPattern;
+    if (ctx->query->relative_root) {
+      w_string_piece rel(ctx->query->relative_root);
+      rel.advance(ctx->root->root_path.size() + 1);
+      globPattern.append(rel.data(), rel.size());
+      globPattern.append("/");
+    }
+    globPattern.append("**");
+
+    auto includeDotfiles = (ctx->query->glob_flags & WM_PERIOD) == 0;
+
+    auto client = getEdenClient(thriftChannel_);
+    return globNameAndDType(
+        client.get(),
+        mountPoint_,
+        std::vector<std::string>{std::move(globPattern)},
+        includeDotfiles);
+  }
+
+  struct GetAllChangesSinceResult {
+    ClockTicks ticks;
+    std::vector<NameAndDType> fileInfo;
+    std::unordered_set<std::string> createdFileNames;
+  };
+
+  /**
+   * Build a GetAllChangesSinceResult for a fresh instance.
+   */
+  GetAllChangesSinceResult makeFreshInstance(QueryContext* ctx) const {
+    GetAllChangesSinceResult result;
+
+    ctx->since.set_fresh_instance();
+    result.ticks = ctx->clockAtStartOfQuery.position().ticks;
+    result.fileInfo = getAllFilesForFreshInstance(ctx);
+
+    return result;
+  }
+
+  /**
+   * Compute all the changes by querying the getFilesChangedSince API.
+   *
+   * This will first compute all the change and then add them to the
+   * GetAllChangesSinceResult::fileInfo vector.
+   *
+   * On error, or when thresholdForFreshInstance_ is exceeded, the clock will
+   * be modified to indicate a fresh instance and an empty set of files will be
+   * returned.
+   */
+  GetAllChangesSinceResult getAllChangesSinceLegacy(QueryContext* ctx) const {
+    auto client = getEdenClient(thriftChannel_);
+
+    // Query eden to fill in the mountGeneration field.
+    JournalPosition position;
+    client->sync_getCurrentJournalPosition(position, mountPoint_);
+    // dial back to the sequence number from the query
+    *position.sequenceNumber() =
+        std::get<QuerySince::Clock>(ctx->since.since).ticks;
+
+    GetAllChangesSinceResult result;
+
+    // Now we can get the change journal from eden
+    FileDelta delta;
+    client->sync_getFilesChangedSince(delta, mountPoint_, position);
+
+    result.createdFileNames.insert(
+        delta.createdPaths()->begin(), delta.createdPaths()->end());
+
+    // The list of changed files is the union of the created, added,
+    // and removed sets returned from eden in list form.
+    for (auto& name : *delta.changedPaths()) {
+      result.fileInfo.emplace_back(std::move(name));
+    }
+    for (auto& name : *delta.removedPaths()) {
+      result.fileInfo.emplace_back(std::move(name));
+    }
+    for (auto& name : *delta.createdPaths()) {
+      result.fileInfo.emplace_back(std::move(name));
+    }
+
+    bool didChangeCommits = delta.snapshotTransitions()->size() >= 2 ||
+        (delta.fromPosition()->snapshotHash() !=
+         delta.toPosition()->snapshotHash());
+
+    if (didChangeCommits && getSCM()) {
+      // Check whether they checked out a new commit or reset the commit to
+      // a different hash.  We interrogate source control to discover
+      // the set of changed files between those hashes, and then
+      // add in any paths that may have changed around snapshot hash
+      // changes events;  These are files whose status cannot be
+      // determined purely from source control operations.
+
+      std::unordered_set<std::string> mergedFileList;
+      for (auto& info : result.fileInfo) {
+        mergedFileList.insert(info.name);
+      }
+
+      SCM::StatusResult changedBetweenCommits;
+      if (delta.snapshotTransitions()->empty()) {
+        auto fromHash = folly::hexlify(*delta.fromPosition()->snapshotHash());
+        auto toHash = folly::hexlify(*delta.toPosition()->snapshotHash());
+
+        // Legacy path: this (incorrectly) ignores any commit transitions
+        // between the initial commit hash and the final commit hash.
+        log(ERR,
+            "since ",
+            *position.sequenceNumber(),
+            " we changed commit hashes from ",
+            fromHash,
+            " to ",
+            toHash,
+            "\n");
+
+        std::vector<std::string> commits{
+            std::move(fromHash), std::move(toHash)};
+        changedBetweenCommits = getFilesChangedBetweenCommits(
+            std::move(commits), ctx->query->alwaysIncludeDirectories);
+      } else {
+        std::vector<std::string> commits;
+        commits.reserve(delta.snapshotTransitions()->size());
+        for (auto& hash : *delta.snapshotTransitions()) {
+          commits.push_back(folly::hexlify(hash));
+        }
+        log(ERR,
+            "since ",
+            *position.sequenceNumber(),
+            " we changed commit hashes ",
+            folly::join(" -> ", commits),
+            "\n");
+        changedBetweenCommits = getFilesChangedBetweenCommits(
+            std::move(commits), ctx->query->alwaysIncludeDirectories);
+      }
+
+      for (auto& fileName : changedBetweenCommits.changedFiles) {
+        mergedFileList.insert(std::string{fileName.view()});
+      }
+      for (auto& fileName : changedBetweenCommits.removedFiles) {
+        mergedFileList.insert(std::string{fileName.view()});
+      }
+      for (auto& fileName : changedBetweenCommits.addedFiles) {
+        mergedFileList.insert(std::string{fileName.view()});
+        result.createdFileNames.insert(std::string{fileName.view()});
+      }
+
+      // Engineers usually don't work on a thousands of files, but on an
+      // giant monorepo, the set of files changed in between 2 revisions
+      // can be very large, and continuing down this route would force
+      // Watchman to fetch metadata about a ton of files, causing delay in
+      // answering the query and large amount of network traffic.
+      //
+      // On these monorepos, tools also set the empty_on_fresh_instance
+      // flag, thus we can simply pretend to return a fresh instance and an
+      // empty fileInfo list.
+      if (thresholdForFreshInstance_ != 0 &&
+          mergedFileList.size() > thresholdForFreshInstance_ &&
+          ctx->query->empty_on_fresh_instance) {
+        log(DBG,
+            "Pretending to be a fresh instance due to too many files changed: ",
+            mergedFileList.size(),
+            "\n");
+        ctx->since.set_fresh_instance();
+        result.fileInfo.clear();
+      } else {
+        // We don't know whether the unclean paths are added, removed
+        // or just changed.  We're going to treat them as changed.
+        mergedFileList.insert(
+            std::make_move_iterator(delta.uncleanPaths()->begin()),
+            std::make_move_iterator(delta.uncleanPaths()->end()));
+
+        // Replace the list of fileNames with the de-duped set
+        // of names we've extracted from source control
+        result.fileInfo.clear();
+        for (auto name : mergedFileList) {
+          result.fileInfo.emplace_back(std::move(name));
+        }
+      }
+    }
+
+    result.ticks = *delta.toPosition()->sequenceNumber();
+    log(DBG,
+        "wanted from ",
+        *position.sequenceNumber(),
+        " result delta from ",
+        *delta.fromPosition()->sequenceNumber(),
+        " to ",
+        *delta.toPosition()->sequenceNumber(),
+        " with ",
+        result.fileInfo.size(),
+        " changed files\n");
+    return result;
+  }
+
+  GetAllChangesSinceResult getAllChangesSinceStreaming(
+      QueryContext* ctx) const {
+    JournalPosition position;
+    position.mountGeneration() = ctx->clockAtStartOfQuery.position().rootNumber;
+    // dial back to the sequence number from the query
+    position.sequenceNumber() =
+        std::get<QuerySince::Clock>(ctx->since.since).ticks;
+
+    StreamChangesSinceParams params;
+    params.mountPoint() = mountPoint_;
+    params.fromPosition() = position;
+
+    auto client = getEdenClient(thriftChannel_);
+    auto [resultChangesSince, stream] = client->sync_streamChangesSince(params);
+
+    GetAllChangesSinceResult result;
+    result.ticks = *resultChangesSince.toPosition()->sequenceNumber();
+
+    // -1 = removed
+    // 0 = changed
+    // 1 = added
+    std::unordered_map<std::string, int> byFile;
+    std::unordered_map<std::string, EdenDtype> dtypes;
+
+    std::move(stream).subscribeInline(
+        [&](folly::Try<ChangedFileResult>&& changeTry) mutable {
+          if (changeTry.hasException()) {
+            log(ERR,
+                "Error: ",
+                folly::exceptionStr(changeTry.exception()),
+                "\n");
+            result = makeFreshInstance(ctx);
+            return false;
+          }
+
+          if (!changeTry.hasValue()) {
+            // End of the stream.
+            return false;
+          }
+
+          const auto& change = changeTry.value();
+          auto& name = *change.name();
+
+          // Changes needs to be deduplicated so a file that was added and then
+          // removed is reported as MODIFIED.
+          switch (*change.status()) {
+            case ScmFileStatus::ADDED:
+              byFile[name] += 1;
+              break;
+            case ScmFileStatus::MODIFIED:
+              byFile[name];
+              break;
+            case ScmFileStatus::REMOVED:
+              byFile[name] -= 1;
+              break;
+            case ScmFileStatus::IGNORED:
+              break;
+          }
+
+          auto dtype = *change.dtype();
+          auto [element, inserted] = dtypes.emplace(name, dtype);
+          if (!inserted && element->second != dtype) {
+            // Due to streamChangesSince not providing any ordering guarantee,
+            // Watchman can't tell what DType a file has in the case where it
+            // changed. Thus let's fallback to an UNKNOWN type, and Watchman
+            // will later query the actual DType from EdenFS.
+            element->second = EdenDtype::UNKNOWN;
+          }
+
+          // Engineers usually don't work on a thousands of files, but on an
+          // giant monorepo, the set of files changed in between 2 revisions
+          // can be very large, and continuing down this route would force
+          // Watchman to fetch metadata about a ton of files, causing delay in
+          // answering the query and large amount of network traffic.
+          //
+          // On these monorepos, tools also set the empty_on_fresh_instance
+          // flag, thus we can simply pretend to return a fresh instance and an
+          // empty fileInfo list.
+          if (thresholdForFreshInstance_ != 0 &&
+              byFile.size() > thresholdForFreshInstance_ &&
+              ctx->query->empty_on_fresh_instance) {
+            result = makeFreshInstance(ctx);
+            return false;
+          }
+
+          return true;
+        });
+
+    for (auto& [name, count] : byFile) {
+      result.fileInfo.emplace_back(name, getDTypeFromEden(dtypes[name]));
+      if (count > 0) {
+        result.createdFileNames.emplace(name);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Compute and return all the changes that occured since the last call.
+   *
+   * On error, or when thresholdForFreshInstance_ is exceeded, the clock will
+   * be modified to indicate a fresh instance and an empty set of files will be
+   * returned.
+   */
+  GetAllChangesSinceResult getAllChangesSince(QueryContext* ctx) const {
+    if (ctx->since.is_fresh_instance()) {
+      // Earlier in the processing flow, we decided that the rootNumber
+      // didn't match the current root which means that eden was restarted.
+      // We need to translate this to a fresh instance result set and
+      // return a list of all possible matching files.
+      return makeFreshInstance(ctx);
+    }
+
+    try {
+      if (!useStreamingSince_) {
+        return getAllChangesSinceLegacy(ctx);
+      } else {
+        return getAllChangesSinceStreaming(ctx);
+      }
+    } catch (const EdenError& err) {
+      // ERANGE: mountGeneration differs
+      // EDOM: journal was truncated.
+      // For other situations we let the error propagate.
+      XCHECK(err.errorCode());
+      if (*err.errorCode() != ERANGE && *err.errorCode() != EDOM) {
+        throw;
+      }
+      // mountGeneration differs, or journal was truncated,
+      // so treat this as equivalent to a fresh instance result
+      return makeFreshInstance(ctx);
+    } catch (const SCMError& err) {
+      // Most likely this means a checkout occurred but we encountered
+      // an error trying to get the list of files changed between the two
+      // commits.  Generate a fresh instance result since we were unable
+      // to compute the list of files changed.
+      log(ERR,
+          "SCM error while processing EdenFS journal update: ",
+          err.what(),
+          "\n");
+      return makeFreshInstance(ctx);
+    }
+  }
+
+  // Compute the set of paths that have changed across all of the transitions
+  // between the list of given commits.
+  //
+  // For example, if commits is [A, B, C], then this accumulates the changes
+  // between [A, B] and [B, C] into one StatusResult.
+  //
+  // This is purely a history operation and does not consider the working copy
+  // status.
+  //
+  // This will  also report all directories changed.
+  SCM::StatusResult getFilesChangedBetweenCommits(
+      std::vector<std::string> commits,
+      bool alwaysIncludeDirectories) const {
+    if (alwaysIncludeDirectories) {
+      // Very few clients are passing this, let's pessimize them by falling
+      // back to the SCM path.
+      //
+      // TODO(xavierd): once EdenFS starts providing the set of files changed
+      // between journal clocks these clients will be fixed for good.
+      return getSCM()->getFilesChangedBetweenCommits(
+          std::move(commits), nullptr, alwaysIncludeDirectories);
+    }
+
+    auto client = getEdenClient(thriftChannel_);
+
+    // -1 = removed
+    // 0 = changed
+    // 1 = added
+    std::unordered_map<std::string, int> byFile;
+
+    for (auto i = 0ul; i + 1 < commits.size(); i++) {
+      auto& commitFrom = commits[i];
+      auto& commitTo = commits[i + 1];
+
+      if (commitFrom == commitTo) {
+        // Older versions of EdenFS could report "commit transitions" from A to
+        // A, in which case we shouldn't ask for the difference.
+        continue;
+      }
+
+      auto key = fmt::format("{}:{}", commitFrom, commitTo);
+      auto status =
+          filesChangedBetweenCommits_
+              .get(
+                  key,
+                  [&](auto&&) -> folly::Future<ScmStatus> {
+                    // Note, we can't use future_getScmStatusBetweenRevisions
+                    // here as the .get() below will drive a secondary future
+                    // that LRUCache creates and not the one returned by this
+                    // lambda. Thus we need to make sure the SemiFuture is
+                    // running on an executor.
+                    return client
+                        ->semifuture_getScmStatusBetweenRevisions(
+                            std::string{rootPath_.view()}, commitFrom, commitTo)
+                        .via(&getThreadPool());
+                  })
+              // TODO(xavierd): rate limit in EdenFS so all the
+              // getScmStatusBetweenRevisions calls can be sent to it
+              // concurrently instead of sequentially.
+              .get()
+              ->value();
+
+      if (!status.errors()->empty()) {
+        SCMError::throwf(
+            "Failed to get status betwen {} and {}", commitFrom, commitTo);
+      }
+
+      for (const auto& [name, file_status] : *status.entries()) {
+        switch (file_status) {
+          case ScmFileStatus::ADDED:
+            byFile[name] += 1;
+            break;
+          case ScmFileStatus::MODIFIED:
+            byFile[name];
+            break;
+          case ScmFileStatus::REMOVED:
+            byFile[name] -= 1;
+            break;
+          default:
+            break;
+        }
+      }
+    }
+
+    SCM::StatusResult res;
+
+    for (auto& [name, count] : byFile) {
+      if (count > 0) {
+        res.addedFiles.emplace_back(name);
+      } else if (count == 0) {
+        res.changedFiles.emplace_back(name);
+        continue;
+      } else {
+        res.removedFiles.emplace_back(name);
+      }
+    }
+
+    return res;
+  }
+
+  w_string rootPath_;
+  std::shared_ptr<apache::thrift::RequestChannel> thriftChannel_;
+  folly::EventBase subscriberEventBase_;
+  std::string mountPoint_;
+  folly::SharedPromise<folly::Unit> subscribeReadyPromise_;
+  bool splitGlobPattern_;
+  bool useStreamingSince_;
+  unsigned int thresholdForFreshInstance_;
+
+  mutable LRUCache<std::string, ScmStatus> filesChangedBetweenCommits_;
 };
 
 #ifdef _WIN32
@@ -1375,6 +1594,37 @@ bool isEdenStopped(w_string root) {
   log(DBG, "edenfs is RUNNING\n");
   return false;
 }
+
+bool isProjfs(const w_string& path) {
+  try {
+    auto fd =
+        openFileHandle(path.c_str(), OpenFileHandleOptions::queryFileInfo());
+    return fd.getReparseTag() == IO_REPARSE_TAG_PROJFS;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+w_string findEdenFSRoot(w_string_piece root_path) {
+  w_string path = root_path.asWString();
+  w_string result = nullptr;
+  while (true) {
+    if (isProjfs(path)) {
+      result = path;
+    } else {
+      break;
+    }
+
+    auto next = path.dirName();
+    if (next == path) {
+      return "";
+    }
+
+    path = next;
+  }
+
+  return result;
+}
 #endif
 
 std::shared_ptr<QueryableView> detectEden(
@@ -1382,38 +1632,21 @@ std::shared_ptr<QueryableView> detectEden(
     const w_string& fstype,
     const Configuration& config) {
 #ifdef _WIN32
-  static const w_string_piece kDotEden{".eden"};
-  auto edenRoot = findFileInDirTree(root_path, {kDotEden});
-  if (edenRoot) {
-    if (isEdenStopped(root_path)) {
-      throw TerminalWatcherError(to<std::string>(
-          root_path.view(),
-          " appears to be an offline EdenFS mount. "
-          "Try running `edenfsctl start` to bring it back online and "
-          "then retry your watch"));
-    }
-
-    auto homeDotEdenRaw = w_string::pathCat({getenv("USERPROFILE"), kDotEden});
-    auto homeDotEden = homeDotEdenRaw.normalizeSeparators();
-
-    if (edenRoot == homeDotEden) {
-      throw std::runtime_error(to<std::string>(
-          "Not considering HOME/.eden as a valid Eden repo (found ",
-          edenRoot.view(),
-          ")"));
-    }
-    try {
-      return std::make_shared<EdenView>(root_path, config);
-    } catch (const std::exception& exc) {
-      throw TerminalWatcherError(to<std::string>(
-          "Failed to initialize eden watcher, and since this is an Eden "
-          "repo, will not allow falling back to another watcher.  Error was: ",
-          exc.what()));
-    }
+  (void)fstype;
+  auto edenRoot = findEdenFSRoot(root_path);
+  log(DBG, "detected eden root: ", edenRoot, "\n");
+  if (!edenRoot) {
+    throw std::runtime_error(
+        to<std::string>("Not an Eden clone: ", root_path.view()));
   }
 
-  throw std::runtime_error(
-      to<std::string>("Not an Eden clone: ", root_path.view()));
+  if (isEdenStopped(root_path)) {
+    throw TerminalWatcherError(to<std::string>(
+        root_path.view(),
+        " appears to be an offline EdenFS mount. "
+        "Try running `edenfsctl start` to bring it back online and "
+        "then retry your watch"));
+  }
 
 #else
   if (!is_edenfs_fs_type(fstype) && fstype != "fuse" &&
@@ -1445,8 +1678,11 @@ std::shared_ptr<QueryableView> detectEden(
         "then retry your watch"));
   }
 
+  // Given that the readlink() succeeded, assume this is an Eden mount.
   auto edenRoot = readSymbolicLink(
       to<std::string>(root_path.view(), "/.eden/root").c_str());
+
+#endif
   if (edenRoot != root_path) {
     // We aren't at the root of the eden mount.
     // Throw a TerminalWatcherError to indicate that the Eden watcher is the
@@ -1455,11 +1691,17 @@ std::shared_ptr<QueryableView> detectEden(
     throw TerminalWatcherError(to<std::string>(
         "you may only watch from the root of an eden mount point. "
         "Try again using ",
-        edenRoot.view()));
+        edenRoot));
   }
-#endif
-  // Given that the readlink() succeeded, assume this is an Eden mount.
-  return std::make_shared<EdenView>(root_path, config);
+
+  try {
+    return std::make_shared<EdenView>(root_path, config);
+  } catch (const std::exception& exc) {
+    throw TerminalWatcherError(to<std::string>(
+        "Failed to initialize eden watcher, and since this is an Eden "
+        "repo, will not allow falling back to another watcher.  Error was: ",
+        exc.what()));
+  }
 }
 
 } // namespace

@@ -312,43 +312,41 @@ void QueryFieldList::add(const w_string& name) {
   auto& defs = field_defs();
   auto it = defs.find(name);
   if (it == defs.end()) {
-    throw QueryParseError("unknown field name '", name.view(), "'");
+    QueryParseError::throwf("unknown field name '{}'", name);
   }
   this->push_back(&it->second);
 }
 
 json_ref field_list_to_json_name_array(const QueryFieldList& fieldList) {
-  auto templ = json_array_of_size(fieldList.size());
+  std::vector<json_ref> templ;
+  templ.reserve(fieldList.size());
 
   for (auto& f : fieldList) {
-    json_array_append_new(templ, w_string_to_json(f->name));
+    templ.push_back(w_string_to_json(f->name));
   }
 
-  return templ;
+  return json_array(std::move(templ));
 }
 
-void parse_field_list(json_ref field_list, QueryFieldList* selected) {
-  uint32_t i;
-
+void parse_field_list(
+    const std::optional<json_ref>& maybe_field_list,
+    QueryFieldList* selected) {
   selected->clear();
 
-  if (!field_list) {
-    // Use the default list
-    field_list = json_array(
-        {typed_string_to_json("name", W_STRING_UNICODE),
-         typed_string_to_json("exists", W_STRING_UNICODE),
-         typed_string_to_json("new", W_STRING_UNICODE),
-         typed_string_to_json("size", W_STRING_UNICODE),
-         typed_string_to_json("mode", W_STRING_UNICODE)});
-  }
+  json_ref field_list = maybe_field_list
+      ? *maybe_field_list
+      : json_array(
+            {typed_string_to_json("name", W_STRING_UNICODE),
+             typed_string_to_json("exists", W_STRING_UNICODE),
+             typed_string_to_json("new", W_STRING_UNICODE),
+             typed_string_to_json("size", W_STRING_UNICODE),
+             typed_string_to_json("mode", W_STRING_UNICODE)});
 
   if (!field_list.isArray()) {
     throw QueryParseError("field list must be an array of strings");
   }
 
-  for (i = 0; i < json_array_size(field_list); i++) {
-    auto jname = json_array_get(field_list, i);
-
+  for (auto& jname : field_list.array()) {
     if (!jname.isString()) {
       throw QueryParseError("field list must be an array of strings");
     }

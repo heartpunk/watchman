@@ -5,8 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/String.h>
+#include <map>
+#include <optional>
+#include <set>
+#include "watchman/Client.h"
 #include "watchman/CommandRegistry.h"
 #include "watchman/Logging.h"
+#include "watchman/Serde.h"
 #include "watchman/root/Root.h"
 #include "watchman/root/resolve.h"
 #include "watchman/sockname.h"
@@ -16,103 +22,105 @@
 
 using namespace watchman;
 
-static bool query_caps(
-    json_ref& response,
-    json_ref& result,
-    const json_ref& arr,
-    bool required) {
-  size_t i;
-  bool have_all = true;
+namespace {
 
-  for (i = 0; i < json_array_size(arr); i++) {
-    const auto& ele = arr.at(i);
-    const char* capname = json_string_value(ele);
-    bool have = capability_supported(json_to_w_string(ele).view());
-    if (!have) {
-      have_all = false;
-    }
-    if (!capname) {
-      break;
-    }
-    result.set(capname, json_boolean(have));
-    if (required && !have) {
-      auto buf = w_string::build(
-          "client required capability `",
-          capname,
-          "` is not supported by this server");
-      response.set("error", w_string_to_json(buf));
-      watchman::log(watchman::ERR, "version: ", buf, "\n");
+class VersionCommand : public PrettyCommand<VersionCommand> {
+ public:
+  static constexpr std::string_view name = "version";
 
-      // Only trigger the error on the first one we hit.  Ideally
-      // we'd tell the user about all of them, but it is a PITA to
-      // join and print them here in C :-/
-      required = false;
-    }
-  }
-  return have_all;
-}
+  static constexpr CommandFlags flags =
+      CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER;
 
-/* version */
-static void cmd_version(struct watchman_client* client, const json_ref& args) {
-  auto resp = make_response();
+  struct RequestOptions : serde::Object {
+    std::vector<w_string> required;
+    std::vector<w_string> optional;
+
+    template <typename X>
+    void map(X& x) {
+      x.skip_if_default("required", required);
+      x.skip_if_default("optional", optional);
+    }
+  };
+
+  using Request = serde::Array<0, RequestOptions>;
+
+  struct Response : BaseResponse {
+    std::optional<w_string> buildinfo;
+    std::map<w_string, bool> capabilities;
+    std::optional<w_string> error;
+
+    template <typename X>
+    void map(X& x) {
+      BaseResponse::map(x);
+      x.skip_if_default("buildinfo", buildinfo);
+      x.skip_if_default("capabilities", capabilities);
+      x.skip_if_default("error", error);
+    }
+  };
+
+  static Response handle(Client*, const Request& request) {
+    Response response;
 
 #ifdef WATCHMAN_BUILD_INFO
-  resp.set(
-      "buildinfo", typed_string_to_json(WATCHMAN_BUILD_INFO, W_STRING_UNICODE));
+    response.buildinfo = w_string{WATCHMAN_BUILD_INFO, W_STRING_UNICODE};
 #endif
 
-  /* ["version"]
-   *    -> just returns the basic version information.
-   * ["version", {"required": ["foo"], "optional": ["bar"]}]
-   *    -> includes capability matching information
-   */
+    auto& options = std::get<0>(request);
 
-  if (json_array_size(args) == 2) {
-    const auto& arg_obj = args.at(1);
+    if (!options.required.empty() || !options.optional.empty()) {
+      for (const auto& capname : options.optional) {
+        response.capabilities[capname] = capability_supported(capname.view());
+      }
 
-    auto req_cap = arg_obj.get_default("required");
-    auto opt_cap = arg_obj.get_default("optional");
+      std::set<w_string> missing;
 
-    auto cap_res = json_object_of_size(
-        (opt_cap ? json_array_size(opt_cap) : 0) +
-        (req_cap ? json_array_size(req_cap) : 0));
+      for (const auto& capname : options.required) {
+        bool have = capability_supported(capname.view());
+        response.capabilities[capname] = have;
+        if (!have) {
+          missing.insert(capname);
+        }
+      }
 
-    if (opt_cap && opt_cap.isArray()) {
-      query_caps(resp, cap_res, opt_cap, false);
+      if (!missing.empty()) {
+        response.error = w_string::build(
+            "client required capabilities [",
+            folly::join(", ", missing),
+            "] not supported by this server");
+      }
     }
-    if (req_cap && req_cap.isArray()) {
-      query_caps(resp, cap_res, req_cap, true);
-    }
 
-    resp.set("capabilities", std::move(cap_res));
+    return response;
   }
 
-  send_and_dispose_response(client, std::move(resp));
-}
-W_CMD_REG(
-    "version",
-    cmd_version,
-    CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
-    NULL)
+  static void printResult(const Response& response) {
+    if (response.error) {
+      fmt::print("error: {}\n", response.error.value());
+    }
+    fmt::print("version: {}\n", response.version);
+    if (response.buildinfo) {
+      fmt::print("buildinfo: {}\n", response.buildinfo.value());
+    }
+  }
+};
+
+WATCHMAN_COMMAND(version, VersionCommand);
 
 /* list-capabilities */
-static void cmd_list_capabilities(
-    struct watchman_client* client,
-    const json_ref&) {
-  auto resp = make_response();
-
+static UntypedResponse cmd_list_capabilities(Client*, const json_ref&) {
+  UntypedResponse resp;
   resp.set("capabilities", capability_get_list());
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
 W_CMD_REG(
     "list-capabilities",
     cmd_list_capabilities,
     CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
-    NULL)
+    NULL);
 
 /* get-sockname */
-static void cmd_get_sockname(struct watchman_client* client, const json_ref&) {
-  auto resp = make_response();
+static UntypedResponse cmd_get_sockname(Client*, const json_ref&) {
+  UntypedResponse resp;
 
   // For legacy reasons we report the unix domain socket as sockname on
   // unix but the named pipe path on windows
@@ -132,38 +140,34 @@ static void cmd_get_sockname(struct watchman_client* client, const json_ref&) {
   }
 #endif
 
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
 W_CMD_REG(
     "get-sockname",
     cmd_get_sockname,
     CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
-    NULL)
+    NULL);
 
-static void cmd_get_config(
-    struct watchman_client* client,
-    const json_ref& args) {
-  json_ref config;
-
+static UntypedResponse cmd_get_config(Client* client, const json_ref& args) {
   if (json_array_size(args) != 2) {
-    send_error_response(client, "wrong number of arguments for 'get-config'");
-    return;
+    throw ErrorResponse("wrong number of arguments for 'get-config'");
   }
 
   auto root = resolveRoot(client, args);
 
-  auto resp = make_response();
+  UntypedResponse resp;
 
-  config = root->config_file;
-
+  std::optional<json_ref> config = root->config_file;
   if (!config) {
     config = json_object();
   }
 
-  resp.set("config", std::move(config));
-  send_and_dispose_response(client, std::move(resp));
+  resp.set("config", std::move(*config));
+  return resp;
 }
-W_CMD_REG("get-config", cmd_get_config, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("get-config", cmd_get_config, CMD_DAEMON, w_cmd_realpath_root);
+
+} // namespace
 
 /* vim:ts=2:sw=2:et:
  */

@@ -21,14 +21,21 @@ struct QueryDebugInfo {
   json_ref render() const;
 };
 
+struct RenderResult {
+  std::vector<json_ref> results;
+  std::optional<json_ref> templ;
+
+  json_ref toJson() &&;
+};
+
 struct QueryResult {
   bool isFreshInstance;
-  json_ref resultsArray;
+  RenderResult resultsArray;
   // Only populated if the query was set to dedup_results
   std::unordered_set<w_string> dedupedFileNames;
   ClockSpec clockAtStartOfQuery;
   uint32_t stateTransCountAtStartOfQuery;
-  json_ref savedStateInfo;
+  std::optional<json_ref> savedStateInfo;
   QueryDebugInfo debugInfo;
 };
 

@@ -9,6 +9,7 @@
 #include <folly/Overload.h>
 #include <folly/String.h>
 #include <folly/Synchronized.h>
+#include <folly/portability/SysTime.h>
 #include <memory>
 
 using namespace watchman;
@@ -30,12 +31,12 @@ ClockSpec::ClockSpec(const json_ref& value) {
   auto parseClockString = [=](const char* str) {
     uint64_t start_time;
     int pid;
-    uint32_t root_number;
+    ClockRoot root_number;
     ClockTicks ticks;
     // Parse a >= 2.8.2 version clock string
     if (sscanf(
             str,
-            "c:%" PRIu64 ":%d:%" PRIu32 ":%" PRIu32,
+            "c:%" PRIu64 ":%d:%" PRIu64 ":%" PRIu64,
             &start_time,
             &pid,
             &root_number,
@@ -44,7 +45,7 @@ ClockSpec::ClockSpec(const json_ref& value) {
       return true;
     }
 
-    if (sscanf(str, "c:%d:%" PRIu32, &pid, &ticks) == 2) {
+    if (sscanf(str, "c:%d:%" PRIu64, &pid, &ticks) == 2) {
       // old-style clock value (<= 2.8.2) -- by setting clock time and root
       // number to 0 we guarantee that this is treated as a fresh instance
       spec = Clock{0, pid, ClockPosition{root_number, ticks}};
@@ -54,33 +55,33 @@ ClockSpec::ClockSpec(const json_ref& value) {
     return false;
   };
 
-  switch (json_typeof(value)) {
+  switch (value.type()) {
     case JSON_INTEGER:
       spec = Timestamp{static_cast<time_t>(value.asInt())};
       return;
 
     case JSON_OBJECT: {
-      auto clockStr = value.get_default("clock");
+      auto clockStr = value.get_optional("clock");
       if (clockStr) {
-        if (!parseClockString(json_string_value(clockStr))) {
+        if (!parseClockString(json_string_value(*clockStr))) {
           throw std::domain_error("invalid clockspec");
         }
       } else {
         spec = Clock{0, 0, ClockPosition{0, 0}};
       }
 
-      auto scm = value.get_default("scm");
+      auto scm = value.get_optional("scm");
       if (scm) {
         scmMergeBase = json_to_w_string(
-            scm.get_default("mergebase", w_string_to_json("")));
-        scmMergeBaseWith = json_to_w_string(scm.get("mergebase-with"));
-        auto savedState = scm.get_default("saved-state");
+            scm->get_default("mergebase", w_string_to_json("")));
+        scmMergeBaseWith = json_to_w_string(scm->get("mergebase-with"));
+        auto savedState = scm->get_optional("saved-state");
         if (savedState) {
-          savedStateConfig = savedState.get("config");
-          savedStateStorageType = json_to_w_string(savedState.get("storage"));
-          auto commitId = savedState.get_default("commit-id");
+          savedStateConfig = savedState->get("config");
+          savedStateStorageType = json_to_w_string(savedState->get("storage"));
+          auto commitId = savedState->get_optional("commit-id");
           if (commitId) {
-            savedStateCommitId = json_to_w_string(commitId);
+            savedStateCommitId = json_to_w_string(*commitId);
           } else {
             savedStateCommitId = w_string();
           }
@@ -195,14 +196,14 @@ QuerySince ClockSpec::evaluate(
 }
 
 bool clock_id_string(
-    uint32_t root_number,
+    ClockRoot root_number,
     ClockTicks ticks,
     char* buf,
     size_t bufsize) {
   int res = snprintf(
       buf,
       bufsize,
-      "c:%" PRIu64 ":%d:%u:%" PRIu32,
+      "c:%" PRIu64 ":%d:%" PRIu64 ":%" PRIu64,
       proc_start_time,
       proc_pid,
       root_number,
@@ -230,7 +231,7 @@ json_ref ClockSpec::toJson() const {
     if (hasSavedStateParams()) {
       auto savedState = json_object(
           {{"storage", w_string_to_json(savedStateStorageType)},
-           {"config", savedStateConfig}});
+           {"config", savedStateConfig.value()}});
       if (savedStateCommitId != w_string()) {
         json_object_set(
             savedState, "commit-id", w_string_to_json(savedStateCommitId));

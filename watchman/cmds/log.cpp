@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "watchman/Client.h"
 #include "watchman/Logging.h"
-#include "watchman/watchman_client.h"
 #include "watchman/watchman_cmd.h"
 
 using namespace watchman;
@@ -14,18 +14,16 @@ using namespace watchman;
 // log-level "debug"
 // log-level "error"
 // log-level "off"
-static void cmd_loglevel(struct watchman_client* client, const json_ref& args) {
+static UntypedResponse cmd_loglevel(Client* client, const json_ref& args) {
   if (json_array_size(args) != 2) {
-    send_error_response(client, "wrong number of arguments to 'log-level'");
-    return;
+    throw ErrorResponse("wrong number of arguments to 'log-level'");
   }
 
   watchman::LogLevel level;
   try {
     level = watchman::logLabelToLevel(json_to_w_string(args.at(1)));
   } catch (std::out_of_range&) {
-    send_error_response(client, "invalid log level for 'log-level'");
-    return;
+    throw ErrorResponse("invalid log level for 'log-level'");
   }
 
   auto clientRef = client->shared_from_this();
@@ -47,66 +45,59 @@ static void cmd_loglevel(struct watchman_client* client, const json_ref& args) {
       client->errorSub = log.subscribe(watchman::ERR, notify);
   }
 
-  auto resp = make_response();
+  UntypedResponse resp;
   resp.set("log_level", json_ref(args.at(1)));
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
-W_CMD_REG("log-level", cmd_loglevel, CMD_DAEMON, NULL)
+W_CMD_REG("log-level", cmd_loglevel, CMD_DAEMON, NULL);
 
 // log "debug" "text to log"
-static void cmd_log(struct watchman_client* client, const json_ref& args) {
+static UntypedResponse cmd_log(Client*, const json_ref& args) {
   if (json_array_size(args) != 3) {
-    send_error_response(client, "wrong number of arguments to 'log'");
-    return;
+    throw ErrorResponse("wrong number of arguments to 'log'");
   }
 
   watchman::LogLevel level;
   try {
     level = watchman::logLabelToLevel(json_to_w_string(args.at(1)));
   } catch (std::out_of_range&) {
-    send_error_response(client, "invalid log level for 'log'");
-    return;
+    throw ErrorResponse("invalid log level for 'log'");
   }
 
   auto text = json_to_w_string(args.at(2));
 
   watchman::log(level, text, "\n");
 
-  auto resp = make_response();
+  UntypedResponse resp;
   resp.set("logged", json_true());
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
-W_CMD_REG("log", cmd_log, CMD_DAEMON | CMD_ALLOW_ANY_USER, NULL)
+W_CMD_REG("log", cmd_log, CMD_DAEMON | CMD_ALLOW_ANY_USER, NULL);
 
 // change the server log level for the logs
-static void cmd_global_log_level(
-    struct watchman_client* client,
-    const json_ref& args) {
+static UntypedResponse cmd_global_log_level(Client*, const json_ref& args) {
   if (json_array_size(args) != 2) {
-    send_error_response(
-        client, "wrong number of arguments to 'global-log-level'");
-    return;
+    throw ErrorResponse("wrong number of arguments to 'global-log-level'");
   }
 
   watchman::LogLevel level;
   try {
     level = watchman::logLabelToLevel(json_to_w_string(args.at(1)));
   } catch (std::out_of_range&) {
-    send_error_response(client, "invalid log level for 'global-log-level'");
-    return;
+    throw ErrorResponse("invalid log level for 'global-log-level'");
   }
 
   watchman::getLog().setStdErrLoggingLevel(level);
 
-  auto resp = make_response();
+  UntypedResponse resp;
   resp.set("log_level", json_ref(args.at(1)));
-  send_and_dispose_response(client, std::move(resp));
+  return resp;
 }
 W_CMD_REG(
     "global-log-level",
     cmd_global_log_level,
     CMD_DAEMON | CMD_ALLOW_ANY_USER,
-    nullptr)
+    nullptr);
 
 /* vim:ts=2:sw=2:et:
  */

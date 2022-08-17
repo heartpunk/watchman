@@ -31,7 +31,7 @@ std::vector<w_string> computeUnconditionalLogFilePrefixes() {
 
   std::vector<w_string> result;
   if (names) {
-    for (auto name : names.array()) {
+    for (auto& name : names->array()) {
       result.push_back(json_to_w_string(name));
     }
   }
@@ -201,12 +201,13 @@ static void execute_common(
     res->isFreshInstance |= since_clock && since_clock->is_fresh_instance;
   }
   if (sample && !ctx->namesToLog.empty()) {
-    auto nameList = json_array_of_size(ctx->namesToLog.size());
+    std::vector<json_ref> nameList;
+    nameList.reserve(ctx->namesToLog.size());
     for (auto& name : ctx->namesToLog) {
-      nameList.array().push_back(w_string_to_json(name));
+      nameList.push_back(w_string_to_json(name));
 
       // Avoid listing everything!
-      if (nameList.array().size() >= 12) {
+      if (nameList.size() >= 12) {
         break;
       }
     }
@@ -214,20 +215,23 @@ static void execute_common(
     sample->add_meta(
         "num_special_files_in_result_set",
         json_integer(ctx->namesToLog.size()));
-    sample->add_meta("special_files_in_result_set", std::move(nameList));
+    sample->add_meta(
+        "special_files_in_result_set", json_array(std::move(nameList)));
     sample->force_log();
   }
 
   if (sample && sample->finish()) {
     ctx->root->addPerfSampleMetadata(*sample);
-    sample->add_meta(
-        "query_execute",
-        json_object(
-            {{"fresh_instance", json_boolean(res->isFreshInstance)},
-             {"num_deduped", json_integer(ctx->num_deduped)},
-             {"num_results", json_integer(ctx->resultsArray.size())},
-             {"num_walked", json_integer(ctx->getNumWalked())},
-             {"query", ctx->query->query_spec}}));
+    auto meta = json_object({
+        {"fresh_instance", json_boolean(res->isFreshInstance)},
+        {"num_deduped", json_integer(ctx->num_deduped)},
+        {"num_results", json_integer(ctx->resultsArray.size())},
+        {"num_walked", json_integer(ctx->getNumWalked())},
+    });
+    if (ctx->query->query_spec) {
+      meta.set("query", json_ref(*ctx->query->query_spec));
+    }
+    sample->add_meta("query_execute", std::move(meta));
     sample->log();
   }
 
@@ -290,7 +294,7 @@ QueryResult w_query_execute(
         // changed files since that saved state, if available.
         auto savedStateInterface = savedStateFactory(
             query->since_spec->savedStateStorageType,
-            query->since_spec->savedStateConfig,
+            query->since_spec->savedStateConfig.value(),
             scm,
             root->config,
             [root](PerfSample& sample) {
@@ -324,20 +328,13 @@ QueryResult w_query_execute(
                         const Query* q,
                         const std::shared_ptr<Root>& r,
                         QueryContext* c) {
+          auto position = c->clockAtStartOfQuery.position();
           auto changedFiles =
               root->view()->getSCM()->getFilesChangedSinceMergeBaseWith(
-                  modifiedMergebase, requestId);
+                  modifiedMergebase, position.toClockString(), requestId);
 
-          auto pathList = json_array_of_size(changedFiles.size());
-          for (auto& f : changedFiles) {
-            json_array_append_new(pathList, w_string_to_json(f));
-          }
-
-          auto spec = r->view()->getMostRecentRootNumberAndTickValue();
-          ClockStamp clock{spec.ticks, ::time(nullptr)};
-          for (auto& pathEntry : pathList.array()) {
-            auto path = json_to_w_string(pathEntry);
-
+          ClockStamp clock{position.ticks, ::time(nullptr)};
+          for (const auto& path : changedFiles) {
             auto fullPath = w_string::pathCat({r->root_path, path});
             if (!c->fileMatchesRelativeRoot(fullPath)) {
               continue;
@@ -391,10 +388,10 @@ QueryResult w_query_execute(
     try {
       std::move(future).get(query->settle_timeouts->settle_timeout);
     } catch (const folly::FutureTimeout&) {
-      throw QueryExecError(fmt::format(
+      QueryExecError::throwf(
           "waitForSettle: timed out waiting for settle {} in {}",
           query->settle_timeouts->settle_period,
-          query->settle_timeouts->settle_timeout));
+          query->settle_timeouts->settle_timeout);
     }
   }
   if (query->sync_timeout.count()) {
@@ -404,7 +401,7 @@ QueryResult w_query_execute(
       auto result = root->syncToNow(query->sync_timeout);
       res.debugInfo.cookieFileNames = std::move(result.cookieFileNames);
     } catch (const std::exception& exc) {
-      throw QueryExecError("synchronization failed: ", exc.what());
+      QueryExecError::throwf("synchronization failed: {}", exc.what());
     }
     ctx.cookieSyncDuration = ctx.stopWatch.lap();
   }

@@ -14,22 +14,6 @@
 
 using namespace watchman;
 
-TEST(Perf, thread_shutdown) {
-  cfg_set_arg("perf_logger_command", json_array({w_string_to_json("echo")}));
-  SCOPE_EXIT {
-    // We must call perf_shutdown() before cfg_shutdown(),
-    // since the perf thread accesses configuration data.
-    perf_shutdown();
-    cfg_shutdown();
-  };
-
-  PerfSample sample("test");
-  sample.force_log();
-  auto logged = sample.finish();
-  EXPECT_TRUE(logged);
-  sample.log();
-}
-
 namespace {
 json_ref make_sample(int i) {
   return json_object({std::make_pair("value", json_integer(i))});
@@ -37,13 +21,13 @@ json_ref make_sample(int i) {
 } // namespace
 
 TEST(Perf, sample_batches_are_limited_to_batch_size) {
-  auto samples = json_array({
+  std::vector<json_ref> samples = {
       make_sample(1),
       make_sample(2),
       make_sample(3),
       make_sample(4),
       make_sample(5),
-  });
+  };
 
   std::vector<std::vector<std::string>> calls;
 
@@ -67,13 +51,13 @@ TEST(Perf, sample_batches_are_limited_to_batch_size) {
 }
 
 TEST(Perf, sample_batches_are_limited_if_total_size_exceeds_argv_limit) {
-  auto samples = json_array({
+  std::vector<json_ref> samples = {
       make_sample(1),
       make_sample(2),
       make_sample(3),
       make_sample(4),
       make_sample(5),
-  });
+  };
 
   std::vector<std::vector<std::string>> calls;
 
@@ -100,10 +84,10 @@ TEST(Perf, sample_batches_are_limited_if_total_size_exceeds_argv_limit) {
 }
 
 TEST(Perf, large_samples_are_passed_in_stdin) {
-  auto samples = json_array({
+  std::vector<json_ref> samples = {
       make_sample(1),
       make_sample(2),
-  });
+  };
 
   std::vector<std::vector<std::string>> arg_calls;
   std::vector<std::string> stdin_calls;
@@ -115,7 +99,9 @@ TEST(Perf, large_samples_are_passed_in_stdin) {
       [&](std::vector<std::string> samples) {
         arg_calls.push_back(std::move(samples));
       },
-      [&](std::string stdin) { stdin_calls.push_back(std::move(stdin)); });
+      [&](std::string stdin_str) {
+        stdin_calls.push_back(std::move(stdin_str));
+      });
 
   ASSERT_EQ(0, arg_calls.size());
   ASSERT_EQ(2, stdin_calls.size());
